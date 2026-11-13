@@ -1,0 +1,1850 @@
+#Author: Gizem Karslioglu
+from __future__ import annotations
+
+import os
+import sys
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+START_TIME          = "2025-07-18 17:00:00"
+END_TIME            = "2025-07-18 18:15:00"
+DAS_FOLDER          = r"/Volumes/X9 Pro/1-Sintela_July2025/Sintela July 18"
+DAS_PATTERN         = "*.h5"
+DAS_CHANNEL         = 149
+DAS_RAW_UNITS       = "phase"
+DAS_RAW_SCALE       = 1.0
+GAUGE_LENGTH_M      = 3.190476268401321
+DX_M                = None
+SEIS_ROOT           = r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02"
+SEIS_STATION        = "ST02"
+SEIS_SELECT         = "XX.ST02..CH1"
+SEIS_KEEP_CHANNELS  = "CHZ,CH1,CH2"
+SEIS_CONVERT        = True
+SEIS_ASSUME_FORMAT  = None
+RESPONSE_FILE       = r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02/ST02_CH1.xml"
+SEIS_OUTPUT         = "VEL"
+WATER_LEVEL         = 60.0
+PRE_FILT            = (0.01, 0.02, 45.0, 50.0)
+C_APP               = 420.0
+C_APP_CURVE         = None
+BIN_SEC             = 60.0
+SPEC_WIN_SEC        = 60.0
+RMS_FMIN            = 1.0
+RMS_FMAX            = 20.0
+F_MIN               = 0.05
+F_MAX               = 50.0
+OUTPUT_FOLDER       = r"/Volumes/X9 Pro/1-Sintela_July2025/Sintela July 18/out_seismic"
+CACHE_FOLDER        = None
+OUT_PREFIX          = "sintela_st02_ch149"
+USE_CACHE           = True
+REBUILD_CACHE       = False
+DPI_SAVE            = 200
+
+EVENT_TIME          = None
+EVENT_WIN_SEC       = 20.0
+EVENT_PAD_SEC       = 30.0
+EVENT_LAG_MAX_SEC   = 2.0
+EVENT_AUTO_POLARITY = True
+FIG_SIZE            = (13, 7)
+
+
+import argparse
+import csv
+import glob as _glob
+import gzip
+import re
+import shutil
+import tempfile
+import warnings
+from datetime import datetime, timezone
+from fractions import Fraction
+from types import SimpleNamespace
+
+from scipy import signal
+from scipy.fft import rfft, irfft, rfftfreq, next_fast_len
+from scipy.ndimage import uniform_filter1d
+
+
+try:
+    import h5py
+except ImportError:
+    sys.exit("h5py is required:  pip install h5py")
+try:
+    from obspy import Stream, Trace, UTCDateTime, read, read_inventory
+    from obspy.core.inventory import Inventory
+except ImportError:
+    sys.exit("obspy is required:  pip install obspy")
+
+
+class Config(SimpleNamespace):
+
+    def __getattr__(self, key):
+        raise AttributeError(
+            f"setting {key!r} is not defined in CONFIG at the top of "
+            f"{os.path.basename(sys.argv[0])}")
+
+
+def window_of(cfg):
+    if not cfg.start_utc:
+        return None, None
+    return UTCDateTime(cfg.start_utc), UTCDateTime(cfg.end_utc)
+
+
+def duration_s(cfg):
+    t0, t1 = window_of(cfg)
+    return float(t1 - t0)
+
+
+def indexed(path: str, index: int | None = None):
+    stem, ext = os.path.splitext(path)
+    stem = re.sub(r"_\d{4}$", "", stem)
+    if index is None:
+        used = [int(m.group(1))
+                for p in _glob.glob(f"{stem}_[0-9][0-9][0-9][0-9]*")
+                for m in [re.search(r"_(\d{4})(?:_[A-Za-z]+)?(?:\.\w+)?$", p)] if m]
+        index = max(used) + 1 if used else 1
+    return f"{stem}_{index:04d}{ext}", index
+
+
+def out_path(cfg, suffix: str, index: int | None = None):
+    base = os.path.join(cfg.outdir, f"{cfg.out_prefix}_{suffix}")
+    if not cfg.index_output:
+        return base, 0
+    return indexed(base, index)
+
+
+import time as _time
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+
+class Progress:
+
+    def __init__(self, label, n, every=10.0):
+        self.label, self.n, self.every = label, int(n), float(every)
+        self.t0 = self.t_last = _time.time()
+
+    def step(self, i, extra=""):
+        now = _time.time()
+        done = i + 1
+        if now - self.t_last >= self.every or done == self.n:
+            el = now - self.t0
+            eta = el / done * (self.n - done) if done else 0.0
+            print(f"  .. {self.label} {done}/{self.n}  ({el:.0f} s elapsed, ~{eta:.0f} s left)"
+                  f"{'  ' + extra if extra else ''}", flush=True)
+            self.t_last = now
+
+
+def banner(title: str, cfg, extra: dict | None = None) -> None:
+    print("=" * 72)
+    print(title)
+    print("=" * 72)
+    print(f"  script         : {os.path.abspath(sys.argv[0])}")
+    t0, t1 = window_of(cfg)
+    print(f"  window         : {t0} -> {t1}  ({(t1 - t0) / 60:g} min)")
+    for k, v in (extra or {}).items():
+        print(f"  {k:15s}: {v}")
+    print("-" * 72)
+
+
+def trace_id(tr) -> str:
+    return str(getattr(tr, "id"))
+
+
+def trace_data(tr) -> np.ndarray:
+    if np.ma.isMaskedArray(tr.data):
+        return np.ma.filled(tr.data.astype(np.float64), np.nan)
+    return np.asarray(tr.data, dtype=np.float64)
+
+
+LAMBDA_VAC = 1550.12e-9
+N_EFF = 1.4682
+XI = 0.78063422216
+
+
+def phase_to_strain_factor(gauge_length: float) -> float:
+    return LAMBDA_VAC / (4.0 * np.pi * float(gauge_length) * N_EFF * XI)
+
+
+_TS_RE = re.compile(
+    r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[T_ ](\d{2})[.:_-]?(\d{2})[.:_-]?(\d{2})")
+
+
+def das_filename_time(path):
+    m = _TS_RE.search(os.path.basename(path))
+    if not m:
+        return None
+    try:
+        return UTCDateTime(*(int(v) for v in m.groups()))
+    except Exception:
+        return None
+
+
+def _epoch_to_utc(v):
+    v = float(v)
+    av = abs(v)
+    if av > 1e17:
+        v /= 1e9
+    elif av > 1e14:
+        v /= 1e6
+    elif av > 1e11:
+        v /= 1e3
+    return UTCDateTime(v)
+
+
+def _value_to_utc(v):
+    if v is None:
+        return None
+    if isinstance(v, np.ndarray):
+        if v.size == 0:
+            return None
+        v = np.ravel(v)[0]
+    if isinstance(v, bytes):
+        v = v.decode("utf-8", errors="ignore")
+    if isinstance(v, str):
+        text = v.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return UTCDateTime(dt.astimezone(timezone.utc))
+        except ValueError:
+            try:
+                return _epoch_to_utc(float(text))
+            except Exception:
+                return None
+    try:
+        return _epoch_to_utc(float(v))
+    except Exception:
+        return None
+
+
+def _h5_attr_num(obj, *names, default=None):
+    if obj is None:
+        return default
+    for n in names:
+        if n in obj.attrs:
+            v = obj.attrs[n]
+            try:
+                if isinstance(v, bytes):
+                    v = v.decode("utf-8", errors="ignore")
+                if isinstance(v, np.ndarray):
+                    v = np.ravel(v)[0]
+                return float(v)
+            except Exception:
+                continue
+    return default
+
+
+def _h5_attr_time(obj, *names):
+    if obj is None:
+        return None
+    for n in names:
+        if n in obj.attrs:
+            t = _value_to_utc(obj.attrs[n])
+            if t is not None:
+                return t
+    return None
+
+
+def read_sintela_h5(path, first=0, last=None, header_only=False):
+    with h5py.File(path, "r") as h5:
+        dset = tset = None
+        acq = h5.get("Acquisition")
+        if acq is not None:
+            for key in acq.keys():
+                if key.startswith("Raw"):
+                    raw = acq[key]
+                    if "RawData" in raw:
+                        dset, tset = raw["RawData"], raw.get("RawDataTime")
+                    break
+        if dset is None and "data" in h5:
+            dset = h5["data"]
+        if dset is None:
+            cands = []
+            h5.visititems(lambda n, o: cands.append((n, o))
+                          if isinstance(o, h5py.Dataset) and o.ndim == 2 else None)
+            if not cands:
+                raise RuntimeError(f"no 2-D dataset in {path}")
+            _, dset = max(cands, key=lambda kv: kv[1].size)
+
+        dx = (_h5_attr_num(acq, "SpatialSamplingInterval", "dx") or
+              _h5_attr_num(h5, "SpatialSamplingInterval", "dx", "channel_spacing"))
+        gl = _h5_attr_num(acq, "GaugeLength", default=np.nan)
+        fs = None
+        for src in (dset.parent, acq, h5):
+            fs = fs or _h5_attr_num(src, "OutputDataRate", "PulseRate", "fs",
+                                    "SamplingFrequency")
+        dt_attr = _h5_attr_num(h5, "dt")
+        if fs is None and dt_attr:
+            fs = 1.0 / dt_attr
+
+        n0, n1 = dset.shape
+        n_loci_attr = _h5_attr_num(acq, "NumberOfLoci")
+        if n_loci_attr and int(n_loci_attr) in (n0, n1):
+            time_first = (n1 == int(n_loci_attr))
+        else:
+            time_first = n0 >= n1
+        nx_total = n1 if time_first else n0
+        last = nx_total if last is None else min(int(last), nx_total)
+        first = max(0, int(first))
+        if header_only:
+            data = None
+        else:
+            data = dset[:, first:last] if time_first else dset[first:last, :].T
+            data = np.asarray(data, np.float32)
+
+        t0 = None
+        if tset is not None:
+            if isinstance(tset, h5py.Dataset) and tset.size >= 2:
+                try:
+                    tt = np.asarray(tset[:2]).astype("float64")
+                    t0 = _epoch_to_utc(tt[0])
+                    step = _epoch_to_utc(tt[1]) - t0
+                    if step > 0:
+                        fs = 1.0 / step
+                except Exception:
+                    pass
+            if t0 is None:
+                t0 = _h5_attr_time(tset, "StartTime", "PartStartTime")
+        if t0 is None:
+            t0 = _h5_attr_time(dset, "PartStartTime", "StartTime")
+        if t0 is None:
+            t0 = _h5_attr_time(dset.parent, "PartStartTime", "StartTime")
+        if t0 is None:
+            t0 = _h5_attr_time(acq, "MeasurementStartTime")
+        if t0 is None:
+            t0 = das_filename_time(path)
+        if t0 is None:
+            raise RuntimeError(f"no DAS start time in metadata or filename: {path}")
+
+    if fs is None or dx is None:
+        raise RuntimeError(f"missing sampling rate or dx in {path}")
+    return data, float(fs), float(dx), t0, float(gl), int(nx_total)
+
+
+def das_file_index(cfg):
+    paths = sorted(_glob.glob(os.path.join(cfg.das_dir, cfg.das_pattern)))
+    if not paths:
+        paths = sorted(_glob.glob(os.path.join(cfg.das_dir, "**", cfg.das_pattern),
+                                  recursive=True))
+    paths = [p for p in paths if not os.path.basename(p).startswith("._")]
+    rows = [(das_filename_time(p), p) for p in paths]
+    stamped = sorted([r for r in rows if r[0] is not None], key=lambda r: r[0])
+    return stamped + [r for r in rows if r[0] is None]
+
+
+def das_coverage(cfg) -> dict:
+    rows = das_file_index(cfg)
+    stamped = [(t, p) for t, p in rows if t is not None]
+    out = dict(n_files=len(rows), start=None, end=None, gaps=[], nominal_s=60.0)
+    if not stamped:
+        return out
+    if len(stamped) > 1:
+        d = np.array([stamped[i + 1][0] - stamped[i][0]
+                      for i in range(len(stamped) - 1)])
+        out["nominal_s"] = float(np.median(d))
+        for i, gap in enumerate(d):
+            if gap > 1.5 * out["nominal_s"]:
+                out["gaps"].append((stamped[i][0] + out["nominal_s"],
+                                    stamped[i + 1][0]))
+    out["start"] = stamped[0][0]
+    out["end"] = stamped[-1][0] + out["nominal_s"]
+    return out
+
+
+def das_files_in_window(cfg):
+    rows = das_file_index(cfg)
+    if not rows:
+        raise SystemExit(f"no DAS files matching {cfg.das_pattern!r} in "
+                         f"{cfg.das_dir!r}")
+    t0, t1 = window_of(cfg)
+    if t0 is None:
+        return [p for _t, p in rows]
+    stamped = [(t, p) for t, p in rows if t is not None]
+    if not stamped:
+        print("  ! no DAS filename carries a UTC stamp; every file is opened")
+        return [p for _t, p in rows]
+    keep, prev = [], None
+    for t, p in stamped:
+        if t < t0:
+            prev = p
+            continue
+        if t >= t1:
+            break
+        keep.append(p)
+    if prev is not None:
+        keep.insert(0, prev)
+    if not keep:
+        cov = das_coverage(cfg)
+        raise SystemExit(
+            f"no DAS file falls in {t0} -> {t1}.\n"
+            f"The DAS directory spans {cov['start']} -> {cov['end']}. "
+            f"Change START_TIME / END_TIME.")
+    return keep
+
+
+def probe_das(cfg) -> dict:
+    for p in das_files_in_window(cfg):
+        try:
+            _d, fs, dx, t0, gl, nx = read_sintela_h5(p, header_only=True)
+        except Exception as exc:
+            print(f"  ! skip {os.path.basename(p)}: {exc}")
+            continue
+        gl = fallback_gauge_length(cfg, gl)
+        return dict(fs_raw=fs, dx=float(cfg.dx or dx), gauge_length=gl,
+                    n_loci=nx, t0=t0, path=p)
+    raise SystemExit("no readable DAS file in the window")
+
+
+class StreamDecimator:
+
+    def __init__(self, k: int, fs_in: float, taps_per_k: int = 20):
+        self.k = int(k)
+        self.fs_in = float(fs_in)
+        self.fs_out = self.fs_in / self.k
+        self.ntaps = int(taps_per_k * self.k) | 1
+        self.h = signal.firwin(self.ntaps, 1.0 / self.k, window=("kaiser", 5.0))
+        self.D = (self.ntaps - 1) // 2
+        self.reset()
+
+    def reset(self) -> None:
+        self.pend = None
+        self.base = 0
+        self.t_origin = None
+
+    def push(self, x: np.ndarray, t0):
+        x = np.asarray(x, dtype=np.float64)
+        if self.t_origin is None:
+            self.t_origin = UTCDateTime(t0)
+            pad = np.repeat(x[:1], self.D, axis=0)
+            avail = np.concatenate([pad, x], axis=0)
+            self.base = -self.D
+        else:
+            avail = np.concatenate([self.pend, x], axis=0)
+        n_valid = avail.shape[0] - self.ntaps + 1
+        if n_valid <= 0:
+            self.pend = avail
+            return None, None
+        h = self.h.reshape((-1,) + (1,) * (avail.ndim - 1))
+        y = signal.fftconvolve(avail, h, mode="valid", axes=0)
+        c0 = self.base + self.D
+        i0 = int((-c0) % self.k)
+        out = y[i0::self.k]
+        m0 = (c0 + i0) // self.k
+        t_out = self.t_origin + (m0 * self.k) / self.fs_in
+        self.base += n_valid
+        self.pend = avail[n_valid:]
+        if out.shape[0] == 0:
+            return None, None
+        return out, t_out
+
+
+def das_decimation_factor(fs_in: float, fs_out) -> int | None:
+    if not fs_out or fs_out >= fs_in * (1 - 1e-9):
+        return None
+    k = int(round(fs_in / fs_out))
+    if k < 2:
+        return None
+    if abs(fs_in / k - fs_out) / fs_out > 0.02:
+        print(f"  NOTE: {fs_in:g} Hz is not an integer multiple of {fs_out:g} Hz;"
+              f" decimating by {k} to {fs_in / k:g} Hz instead")
+    return k
+
+
+def das_raw_to_strain(x: np.ndarray, cfg, gauge_length: float) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64) * float(cfg.das_raw_scale)
+    u = str(cfg.das_raw_units).lower()
+    if u == "phase":
+        return x * phase_to_strain_factor(gauge_length)
+    if u == "strain":
+        return x
+    raise SystemExit(f"das_raw_units={cfg.das_raw_units!r} is not supported "
+                     f"(use 'phase' or 'strain')")
+
+
+def stream_das_blocks(cfg, channels=None, fs_read=None, verbose=True):
+    files = das_files_in_window(cfg)
+    chs = sorted({int(c) for c in (channels if channels is not None
+                                   else cfg.das_channels)})
+    if not chs:
+        raise SystemExit("no DAS channel selected (das_channels in CONFIG)")
+    first, last = min(chs), max(chs) + 1
+    t0w, t1w = window_of(cfg)
+    dec = None
+    meta = {}
+    prev_end = None
+    prog = Progress("DAS files", len(files))
+    for i, path in enumerate(files):
+        try:
+            data, fs_f, dx_f, t_file, gl_f, nx = read_sintela_h5(path, first, last)
+        except Exception as exc:
+            print(f"  ! skip {os.path.basename(path)}: {exc}")
+            continue
+        if t0w is not None:
+            nt = data.shape[0]
+            i0 = max(0, int(round((t0w - t_file) * fs_f)))
+            i1 = min(nt, int(round((t1w - t_file) * fs_f)))
+            if i0 >= nt or i1 <= i0:
+                continue
+            data = data[i0:i1]
+            t_file = t_file + i0 / fs_f
+        cols = [c - first for c in chs if 0 <= c - first < data.shape[1]]
+        if len(cols) != len(chs) or first < 0:
+            raise SystemExit(
+                f"DAS channel(s) {[c for c in chs if c < 0 or c >= nx]} "
+                f"do not exist in {os.path.basename(path)} (the file has {nx} "
+                f"loci, channels 0..{nx - 1}).")
+        if not meta:
+            gl = fallback_gauge_length(cfg, gl_f)
+            meta = dict(fs_raw=float(fs_f), dx=float(cfg.dx or dx_f),
+                        gauge_length=gl, channels=list(chs), n_loci=nx)
+            k = das_decimation_factor(fs_f, fs_read)
+            if k:
+                dec = StreamDecimator(k, fs_f)
+                meta["fs"] = dec.fs_out
+                if verbose:
+                    print(f"  DAS decimation : {fs_f:g} -> {dec.fs_out:g} Hz (k={k}, "
+                          f"continuous across files)")
+            else:
+                meta["fs"] = float(fs_f)
+        eps = das_raw_to_strain(data[:, cols], cfg, meta["gauge_length"])
+        if prev_end is not None and abs(t_file - prev_end) > 1.5 / fs_f:
+            if dec:
+                dec.reset()
+            if verbose:
+                print(f"  DAS gap        : {prev_end} -> {t_file} "
+                      f"({t_file - prev_end:.1f} s)")
+        prev_end = t_file + eps.shape[0] / fs_f
+        if dec is None:
+            yield eps, t_file, meta["fs"], meta["channels"], meta
+        else:
+            y, t_out = dec.push(eps, t_file)
+            if y is not None:
+                yield y, t_out, meta["fs"], meta["channels"], meta
+        if verbose:
+            prog.step(i)
+    if not meta:
+        raise SystemExit("no usable DAS data in that window")
+
+
+def das_trace_id(cfg, ch: int, fs: float, instrument: str = "S"):
+    band = ("F" if fs >= 1000 else "C" if fs >= 250 else "H" if fs >= 80
+            else "B" if fs >= 10 else "M")
+    return cfg.das_net_code, f"D{int(ch):04d}"[:5], "", f"{band}{instrument}1"
+
+
+def read_das_window(cfg, channels=None, fs_read=None, verbose=True):
+    chs = list(channels if channels is not None else cfg.das_channels)
+    est_mb = (duration_s(cfg) * (fs_read or 1000.0) * len(chs) * 8) / 1e6
+    if est_mb > float(cfg.max_memory_mb):
+        raise SystemExit(
+            f"loading {duration_s(cfg) / 60:g} min of {len(chs)} DAS channel(s) "
+            f"needs ~{est_mb:.0f} MB > max_memory_mb={cfg.max_memory_mb:g}. "
+            f"Shorten START_TIME..END_TIME or raise MAX_MEMORY_MB.")
+    pieces, meta = {}, {}
+    for block, t_start, fs, chs_out, meta in stream_das_blocks(cfg, chs, fs_read,
+                                                                verbose):
+        for j, ch in enumerate(chs_out):
+            pieces.setdefault(ch, []).append((t_start, fs, block[:, j].copy()))
+    st = Stream()
+    for ch, plist in pieces.items():
+        net, sta, loc, cha = das_trace_id(cfg, ch, meta["fs"])
+        for t_start, fs, d in plist:
+            st += Trace(data=np.ascontiguousarray(d),
+                        header=dict(network=net, station=sta, location=loc,
+                                    channel=cha, sampling_rate=float(fs),
+                                    starttime=UTCDateTime(t_start),
+                                    npts=int(d.size)))
+    if not len(st):
+        raise SystemExit("no DAS data in that window")
+    st.merge(method=1, fill_value=None)
+    if verbose:
+        print(f"  DAS            : {len(st)} trace(s), {meta['fs']:g} Hz, "
+              f"dx={meta['dx']:.3f} m, GL={meta['gauge_length']:.4f} m, "
+              f"K={phase_to_strain_factor(meta['gauge_length']):.4e} strain/rad")
+    return st, meta
+
+
+MSEED_EXT = {".mseed", ".ms", ".miniseed", ".msd", ".seed"}
+_NON_WAVEFORM_EXT = {".xml", ".stationxml", ".csv", ".json", ".yaml", ".yml",
+                     ".png", ".jpg", ".jpeg", ".pdf", ".txt", ".md", ".log",
+                     ".npz", ".h5", ".resp", ".dataless", ".zip", ".py"}
+_CANDIDATE_FORMATS = [
+    "MSEED", "SAC", "SEG2", "SEGY", "SU", "GCF", "REFTEK130", "RG16", "GSE2",
+    "SEISAN", "Q", "SH_ASC", "SLIST", "TSPAIR", "PDAS", "KINEMETRICS_EVT",
+    "DMX", "WAV", "Y", "CSS", "AH", "KNET"]
+_SEIS_FNAME = [
+    re.compile(r"^(?P<net>[A-Z0-9]{1,2})-(?P<sta>[A-Z0-9_]{1,5})-"
+               r"(?P<Y>\d{4})(?P<M>\d{2})(?P<D>\d{2})"
+               r"(?P<h>\d{2})(?P<m>\d{2})(?P<s>\d{2})(?:\.(?P<ms>\d{1,6}))?", re.I),
+    re.compile(r"(?P<Y>\d{4})[-_]?(?P<M>\d{2})[-_]?(?P<D>\d{2})"
+               r"[T_ .]?(?P<h>\d{2})[:._-]?(?P<m>\d{2})[:._-]?(?P<s>\d{2})"
+               r"(?:\.(?P<ms>\d{1,6}))?"),
+]
+_MANIFEST = "conversion_index.csv"
+_MANIFEST_FIELDS = ["source", "source_size", "source_mtime", "output", "seed_id",
+                    "format", "start", "end", "fs", "npts", "note"]
+
+
+def parse_seis_filename(path):
+    base = os.path.basename(path)
+    for pat in _SEIS_FNAME:
+        m = pat.search(base)
+        if not m:
+            continue
+        g = m.groupdict()
+        try:
+            t = UTCDateTime(int(g["Y"]), int(g["M"]), int(g["D"]),
+                            int(g["h"]), int(g["m"]), int(g["s"]))
+        except Exception:
+            continue
+        if g.get("ms"):
+            t += int(g["ms"]) / (10 ** len(g["ms"]))
+        return t, g.get("net"), g.get("sta")
+    return None, None, None
+
+
+def _is_waveform_candidate(path):
+    b = os.path.basename(path)
+    if b.startswith(".") or b == _MANIFEST:
+        return False
+    stem = b[:-3] if b.lower().endswith(".gz") else b
+    return os.path.splitext(stem.lower())[1] not in _NON_WAVEFORM_EXT
+
+
+def read_any_waveform(path, assume=None):
+    tmp, rp = None, path
+    try:
+        if path.lower().endswith(".gz"):
+            fd, tmp = tempfile.mkstemp(prefix="seis_unzip_",
+                                       suffix=os.path.splitext(path[:-3])[1] or ".raw")
+            os.close(fd)
+            with gzip.open(path, "rb") as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            rp = tmp
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if assume:
+                try:
+                    return read(rp, format=assume), assume
+                except Exception:
+                    return None, None
+            try:
+                st = read(rp)
+                return st, getattr(st[0].stats, "_format", "auto") if len(st) else "auto"
+            except Exception:
+                pass
+            for fmt in _CANDIDATE_FORMATS:
+                try:
+                    st = read(rp, format=fmt)
+                    if len(st):
+                        return st, fmt
+                except Exception:
+                    continue
+    except (OSError, EOFError):
+        pass
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return None, None
+
+
+def _list_raw_files(station_dir, converted_subdir):
+    out = []
+    conv = os.path.abspath(os.path.join(station_dir, converted_subdir))
+    for root, dirs, files in os.walk(station_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and
+                   not os.path.abspath(os.path.join(root, d)).startswith(conv)]
+        for f in sorted(files):
+            p = os.path.join(root, f)
+            if _is_waveform_candidate(p):
+                out.append(p)
+    return out
+
+
+def detect_seismic_stations(cfg, verbose=True) -> dict:
+    root = os.path.abspath(os.path.expanduser(cfg.seis_root))
+    if not os.path.isdir(root):
+        raise SystemExit(f"seis_root is not a directory: {root}")
+    if cfg.seis_station_dirs:
+        dirs = [os.path.abspath(os.path.expanduser(d))
+                for d in cfg.seis_station_dirs.values()]
+    else:
+        dirs = [os.path.join(root, d) for d in sorted(os.listdir(root))
+                if os.path.isdir(os.path.join(root, d)) and not d.startswith(".")
+                and d != cfg.converted_subdir]
+        if not dirs:
+            dirs = [root]
+    found = {}
+    for d in dirs:
+        files = _list_raw_files(d, cfg.converted_subdir)
+        by_sta = {}
+        for p in files:
+            _t, net, sta = parse_seis_filename(p)
+            by_sta.setdefault(((sta or "").upper(), (net or "").upper()), []).append(p)
+        if ("", "") in by_sta:
+            st, _fmt = read_any_waveform(by_sta[("", "")][0])
+            code = (str(st[0].stats.station).upper(), str(st[0].stats.network).upper()) \
+                if st is not None and len(st) else (os.path.basename(d).upper(), "")
+            by_sta.setdefault(code, []).extend(by_sta.pop(("", "")))
+        conv_dir = os.path.join(d, cfg.converted_subdir)
+        if not files and os.path.isdir(conv_dir):
+            man = _read_manifest(conv_dir)
+            for r in man.values():
+                sid = r.get("seed_id", "")
+                if sid.count(".") == 3:
+                    by_sta.setdefault((sid.split(".")[1].upper(),
+                                       sid.split(".")[0].upper()), [])
+        for (sta, net), plist in by_sta.items():
+            e = found.setdefault(sta, dict(dir=d, raw_files=[], net=net,
+                                           converted_dir=conv_dir))
+            e["raw_files"].extend(plist)
+    if verbose:
+        print(f"  seismic root   : {root}")
+        if not found:
+            print("  ! no station waveform files found")
+        for sta, e in sorted(found.items()):
+            n_conv = len(_glob.glob(os.path.join(e["converted_dir"], "*.mseed")))
+            print(f"      station {sta:6s} {len(e['raw_files']):6d} raw file(s), "
+                  f"{n_conv:6d} converted  [{os.path.basename(e['dir'])}]")
+    return found
+
+
+def _read_manifest(conv_dir) -> dict:
+    path = os.path.join(conv_dir, _MANIFEST)
+    out = {}
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, newline="") as fh:
+            for r in csv.DictReader(fh):
+                out[(r.get("source", ""), r.get("output", ""), r.get("seed_id", ""))] = r
+    except Exception as exc:
+        print(f"  ! unreadable manifest {path}: {exc}")
+    return out
+
+
+def _write_manifest(conv_dir, rows: dict) -> None:
+    path = os.path.join(conv_dir, _MANIFEST)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=_MANIFEST_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows.values():
+            w.writerow({k: r.get(k, "") for k in _MANIFEST_FIELDS})
+    os.replace(tmp, path)
+
+
+def _bad_time(t):
+    return t.year < 1980 or t > UTCDateTime() + 86400 * 365
+
+
+def _unique_target(path):
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    k = 2
+    while os.path.exists(f"{stem}_{k}{ext}"):
+        k += 1
+    return f"{stem}_{k}{ext}"
+
+
+def convert_station_to_mseed(cfg, sta: str, info: dict, verbose=True) -> int:
+    conv = info["converted_dir"]
+    os.makedirs(conv, exist_ok=True)
+    rows = _read_manifest(conv)
+    done = {}
+    for r in rows.values():
+        done[r.get("source", "")] = (r.get("source_size", ""), r.get("source_mtime", ""))
+    keep_all = str(cfg.seis_keep_channels).upper() == "ALL"
+    keep = {c.strip().upper() for c in str(cfg.seis_keep_channels).split(",") if c.strip()}
+
+    t0w, t1w = window_of(cfg)
+    files = info["raw_files"]
+    if t0w is not None:
+        stamped = sorted((t, p) for p in files for t in [parse_seis_filename(p)[0]] if t is not None)
+        if len(stamped) > 1:
+            span = float(np.median(np.diff([t.timestamp for t, _p in stamped])))
+            span = max(span, 60.0) * 1.5 + float(cfg.seis_pad_s)
+            near = {p for t, p in stamped if t <= t1w + cfg.seis_pad_s and t + span >= t0w}
+            files = [p for p in files if p in near or parse_seis_filename(p)[0] is None]
+            if verbose and len(files) < len(info["raw_files"]):
+                print(f"  convert {sta:6s}: {len(files)} of {len(info['raw_files'])} raw files "
+                      f"can overlap {t0w} -> {t1w}")
+    todo = []
+    for p in files:
+        try:
+            stt = os.stat(p)
+        except OSError:
+            continue
+        size, mtime = str(stt.st_size), f"{stt.st_mtime:.0f}"
+        prev = done.get(p)
+        if prev is not None and (prev == ("", "") or prev == (size, mtime)):
+            continue
+        todo.append((p, size, mtime))
+    if verbose:
+        print(f"  convert {sta:6s}: {len(files) - len(todo)} already "
+              f"done, {len(todo)} to convert -> {conv}")
+    prog = Progress("converted", len(todo))
+    n_ok = n_fail = 0
+    for i, (p, size, mtime) in enumerate(todo):
+        base = dict(source=p, source_size=size, source_mtime=mtime)
+        st, fmt = read_any_waveform(p, cfg.seis_assume_format)
+        good = Stream()
+        if st is not None:
+            for tr in st:
+                fs = float(getattr(tr.stats, "sampling_rate", 0.0) or 0.0)
+                ch = str(tr.stats.channel or "").upper()
+                if fs > 0 and tr.stats.npts > 0 and (keep_all or ch in keep):
+                    good.append(tr)
+        if not len(good):
+            n_fail += 1
+            rows[(p, "", "")] = dict(base, note="FAILED: no readable waveform "
+                                               "channel" if st is None else
+                                     "FAILED: no requested channel")
+            if verbose:
+                prog.step(i, os.path.basename(p) + " (unreadable)")
+            continue
+        t_file, net_f, sta_f = parse_seis_filename(p)
+        for tr in good:
+            s = tr.stats
+            if t_file is not None and _bad_time(s.starttime):
+                s.starttime = t_file
+            if not s.network and net_f:
+                s.network = net_f.upper()[:2]
+            if not s.station and sta_f:
+                s.station = sta_f.upper()[:5]
+        groups = {}
+        for tr in good:
+            groups.setdefault(tr.id, Stream()).append(tr)
+        for sid, sub in groups.items():
+            try:
+                sub.merge(method=1, fill_value=None)
+                sub = sub.split()
+            except Exception:
+                pass
+            for tr in sub:
+                tr.data = (np.ascontiguousarray(tr.data, dtype=np.int32)
+                           if np.issubdtype(np.asarray(tr.data).dtype, np.integer)
+                           else np.ascontiguousarray(tr.data, dtype=np.float32))
+            s0 = sub[0].stats
+            name = (f"{s0.network}.{s0.station}.{s0.location}.{s0.channel}__"
+                    f"{min(t.stats.starttime for t in sub).strftime('%Y%m%dT%H%M%SZ')}__"
+                    f"{max(t.stats.endtime for t in sub).strftime('%Y%m%dT%H%M%SZ')}.mseed")
+            target = _unique_target(os.path.join(conv, name))
+            sub.write(target, format="MSEED", reclen=4096)
+            rows[(p, target, sid)] = dict(
+                base, output=target, seed_id=sid, format=fmt,
+                start=str(min(t.stats.starttime for t in sub)),
+                end=str(max(t.stats.endtime for t in sub)),
+                fs=sub[0].stats.sampling_rate, npts=sum(t.stats.npts for t in sub),
+                note="")
+        n_ok += 1
+        if (i + 1) % 25 == 0:
+            _write_manifest(conv, rows)
+        if verbose:
+            prog.step(i, os.path.basename(p))
+    if todo:
+        _write_manifest(conv, rows)
+    if verbose and todo:
+        print(f"      converted {n_ok}, unreadable {n_fail}")
+        if n_fail and not n_ok:
+            print("      ! nothing could be read. Set seis_assume_format in "
+                  "CONFIG to the recorder format if you know it.")
+    return n_ok
+
+
+def prepare_seismic(cfg, stations=None, verbose=True) -> dict:
+    print("  -- seismic step 1: detect stations")
+    found = detect_seismic_stations(cfg, verbose)
+    want = [s.upper() for s in (stations if stations is not None
+                                else cfg.seis_stations)] or sorted(found)
+    missing = [s for s in want if s not in found]
+    if missing:
+        raise SystemExit(f"station(s) {missing} not found under {cfg.seis_root}. "
+                         f"Detected: {sorted(found)}")
+    print("  -- seismic step 2: convert to MiniSEED (incremental)")
+    if cfg.seis_convert:
+        for s in want:
+            convert_station_to_mseed(cfg, s, found[s], verbose)
+    else:
+        print("      seis_convert = False: using existing MiniSEED only")
+    return {s: found[s] for s in want}
+
+
+def _converted_rows(info):
+    conv = info["converted_dir"]
+    rows = []
+    for r in _read_manifest(conv).values():
+        out = r.get("output", "")
+        if not out or not r.get("seed_id"):
+            continue
+        if not os.path.exists(out):
+            alt = os.path.join(conv, os.path.basename(out))
+            if not os.path.exists(alt):
+                continue
+            out = alt
+        try:
+            rows.append((r["seed_id"], UTCDateTime(r["start"]), UTCDateTime(r["end"]),
+                         out))
+        except Exception:
+            continue
+    if rows:
+        return rows
+    for p in sorted(_glob.glob(os.path.join(conv, "**", "*"), recursive=True)):
+        if os.path.splitext(p)[1].lower() not in MSEED_EXT:
+            continue
+        try:
+            for tr in read(p, headonly=True):
+                rows.append((tr.id, tr.stats.starttime, tr.stats.endtime, p))
+        except Exception:
+            continue
+    return rows
+
+
+def seismic_coverage(stations: dict) -> dict:
+    cov = {}
+    for info in stations.values():
+        for sid, t0, t1, _p in _converted_rows(info):
+            a = cov.get(sid)
+            cov[sid] = ((t0, t1, 1) if a is None else
+                        (min(a[0], t0), max(a[1], t1), a[2] + 1))
+    return cov
+
+
+def _id_matches(sid: str, channel_filter) -> bool:
+    if not channel_filter:
+        return True
+    cha = sid.split(".")[-1].upper()
+    return any(cha == c.upper() or sid == c or c in sid for c in channel_filter)
+
+
+def read_seismic_window(cfg, stations: dict, channel_filter=None, pad_s=0.0,
+                        verbose=True) -> Stream:
+    t0, t1 = window_of(cfg)
+    st = Stream()
+    n_files = 0
+    for info in stations.values():
+        for sid, a, b, path in _converted_rows(info):
+            if not _id_matches(sid, channel_filter):
+                continue
+            if t0 is not None and (b < t0 - pad_s or a > t1 + pad_s):
+                continue
+            try:
+                part = read(path)
+            except Exception as exc:
+                print(f"  ! skip {os.path.basename(path)}: {exc}")
+                continue
+            st += Stream([tr for tr in part if _id_matches(tr.id, channel_filter)])
+            n_files += 1
+    if not len(st):
+        cov = seismic_coverage(stations)
+        lines = "\n".join(f"      {k:18s} {v[0]} -> {v[1]}" for k, v in sorted(cov.items()))
+        raise SystemExit(f"no seismic data overlap {t0} -> {t1}.\nConverted archive "
+                         f"covers:\n{lines or '      (nothing)'}\nChange START_TIME / "
+                         f"END_TIME.")
+    for tr in st:
+        tr.data = tr.data.astype(np.float64)
+    st.merge(method=1, fill_value=None)
+    if t0 is not None:
+        st.trim(t0 - pad_s, t1 + pad_s)
+    st = Stream([tr for tr in st if tr.stats.npts > 1])
+    if verbose:
+        print(f"  seismic read   : {n_files} file(s) -> {len(st)} trace(s)")
+    return st
+
+
+def _inventory_files_for(cfg, sta: str, info: dict, channel: str | None):
+    spec = cfg.inventory
+    if isinstance(spec, dict):
+        spec = spec.get(sta, spec.get(sta.upper(), "auto"))
+    if spec and spec != "auto":
+        return [spec]
+    cands = []
+    for pat in ("*.xml", "*.XML", "*.stationxml", "RESP*", "*.dataless"):
+        cands += _glob.glob(os.path.join(info["dir"], "**", pat), recursive=True)
+    cands = sorted({c for c in cands if not os.path.basename(c).startswith("._")
+                    and os.path.basename(c) != _MANIFEST})
+    if channel:
+        best = [c for c in cands if sta.upper() in os.path.basename(c).upper()
+                and channel.upper() in os.path.basename(c).upper()]
+        if best:
+            return best
+    named = [c for c in cands if sta.upper() in os.path.basename(c).upper()]
+    return named or cands
+
+
+def load_station_inventory(cfg, stations: dict, channel: str | None = None,
+                           verbose=True):
+    inv = Inventory(networks=[], source="combined")
+    n_ok = 0
+    for sta, info in stations.items():
+        files = _inventory_files_for(cfg, sta, info, channel)
+        if channel and len(files) == 1 and os.path.exists(files[0]):
+            try:
+                has = bool(read_inventory(files[0]).select(station=sta, channel=channel))
+            except Exception:
+                has = False
+            if not has:
+                cfg_auto = Config(**{**vars(cfg), "inventory": "auto"})
+                files = files + [f for f in _inventory_files_for(cfg_auto, sta, info, channel)
+                                 if f not in files]
+        for f in files:
+            try:
+                inv += read_inventory(f)
+                n_ok += 1
+                if verbose:
+                    print(f"  inventory      : {sta} <- {f}")
+            except Exception as exc:
+                if verbose:
+                    print(f"  ! inventory {f} unreadable: {exc}")
+    return inv if n_ok else None
+
+
+def select_point_trace(st: Stream, inv, cfg, verbose=True) -> Stream:
+    cands = list(st)
+    ids = sorted({tr.id for tr in cands})
+    if cfg.seis_select:
+        tok = str(cfg.seis_select)
+        cands = [tr for tr in cands if tok == tr.id or tok in tr.id]
+        if not cands:
+            raise SystemExit(f"seis_select={tok!r} matched none of: {', '.join(ids)}")
+    if cfg.seis_station:
+        s = str(cfg.seis_station).upper()
+        cands = [tr for tr in cands if str(tr.stats.station).upper() == s]
+        if not cands:
+            raise SystemExit(f"seis_station={s!r} matched none of: {', '.join(ids)}")
+    comp = (cfg.seis_component or "").upper()
+    if comp:
+        hits = [tr for tr in cands if str(tr.stats.channel).upper().endswith(comp)]
+        if not hits and inv is not None:
+            tol = float(cfg.component_azimuth_tolerance_deg)
+            for tr in cands:
+                try:
+                    o = inv.get_orientation(tr.id, tr.stats.starttime)
+                    az, dip = float(o["azimuth"]) % 360, float(o["dip"])
+                except Exception:
+                    continue
+                d = lambda x, y: abs((x - y + 180) % 360 - 180)
+                if ((comp == "Z" and abs(abs(dip) - 90) <= tol) or
+                        (comp == "E" and abs(dip) <= tol and min(d(az, 90), d(az, 270)) <= tol) or
+                        (comp == "N" and abs(dip) <= tol and min(d(az, 0), d(az, 180)) <= tol)):
+                    hits.append(tr)
+        if not hits:
+            raise SystemExit(f"component {comp!r} could not be identified among "
+                             f"{', '.join(sorted({t.id for t in cands}))}; set "
+                             f"seis_select to the exact SEED id in CONFIG")
+        cands = hits
+    chosen = sorted({tr.id for tr in cands})
+    if len(chosen) > 1:
+        best = max(cands, key=lambda tr: (tr.stats.sampling_rate, tr.stats.npts))
+        print(f"  ! several traces match {chosen}; using {best.id}")
+        cands = [tr for tr in cands if tr.id == best.id]
+    out = Stream([tr.copy() for tr in cands])
+    if verbose:
+        print(f"  seismic trace  : {trace_id(out[0])}")
+    return out
+
+
+def remove_response(st: Stream, inv, cfg, output=None, taper_frac=0.05,
+                    taper_max_s=None, verbose=True):
+    output = (output or cfg.seis_output).upper()
+    if inv is None or not cfg.seis_remove_response:
+        if verbose:
+            print("  ! seismic data stay in COUNTS (no inventory or "
+                  "seis_remove_response=False): absolute levels are NOT valid")
+        return st.copy(), "COUNTS"
+    out = st.copy().split()
+    out.detrend("linear")
+    if taper_max_s:
+        out.taper(0.5, type="cosine", max_length=taper_max_s)
+    else:
+        out.taper(taper_frac, type="cosine")
+    pf = tuple(cfg.pre_filt) if cfg.pre_filt else None
+    ok = Stream()
+    for tr in out:
+        nyq = tr.stats.sampling_rate / 2.0
+        pfi = pf
+        if pf and pf[3] >= nyq:
+            pfi = (pf[0], pf[1], min(pf[2], 0.8 * nyq), min(pf[3], 0.9 * nyq))
+        try:
+            tr.remove_response(inventory=inv, output=output, pre_filt=pfi,
+                               water_level=cfg.water_level, zero_mean=True,
+                               taper=False)
+            ok += tr
+        except Exception as exc:
+            print(f"  ! no usable response for {tr.id}: {exc} -- dropped")
+    if not len(ok):
+        raise SystemExit("the inventory matched none of the seismic traces")
+    ok.merge(method=1, fill_value=None)
+    if verbose:
+        print(f"  response       : removed -> {output}, pre_filt={pf}, "
+              f"water_level={cfg.water_level}")
+    return ok, output
+
+
+def retarget_rate(st: Stream, fs_target) -> Stream:
+    if not fs_target:
+        return st.copy()
+    fs_target = float(fs_target)
+    out = Stream()
+    for tr in st.copy().split():
+        fs = float(tr.stats.sampling_rate)
+        if abs(fs - fs_target) < 1e-9 or fs < fs_target:
+            out += tr
+            continue
+        fr = Fraction(fs_target / fs).limit_denominator(10000)
+        up, down = fr.numerator, fr.denominator
+        if abs(fs * up / down - fs_target) / fs_target > 1e-8:
+            raise RuntimeError(f"cannot resample {fs:g} -> {fs_target:g} Hz exactly")
+        tr.detrend("linear")
+        y = signal.resample_poly(np.asarray(tr.data, np.float64), up, down,
+                                 window=("kaiser", 5.0))
+        tr.data = np.ascontiguousarray(y)
+        tr.stats.sampling_rate = fs_target
+        out += tr
+    out.merge(method=1, fill_value=None)
+    return out
+
+
+def common_rate(fs_das_raw: float, fs_seis: float, fs_target) -> float:
+    cap = min(float(fs_seis), float(fs_target) if fs_target else np.inf)
+    for k in range(1, 100000):
+        f = fs_das_raw / k
+        if f <= cap * (1 + 1e-9):
+            return float(f)
+    return float(cap)
+
+
+def load_point_seismic(cfg, fs_out=None, verbose=True, stations=None):
+    if stations is None:
+        stations = prepare_seismic(
+            cfg, [cfg.seis_station] if cfg.seis_station else [], verbose)
+    print("  -- seismic step 3: read, select, remove response")
+    chan = str(cfg.seis_select).split(".")[-1] if cfg.seis_select else None
+    st = read_seismic_window(cfg, stations, [chan] if chan else None,
+                             pad_s=cfg.seis_pad_s, verbose=verbose)
+    inv = load_station_inventory(cfg, stations, chan, verbose)
+    st = select_point_trace(st, inv, cfg, verbose)
+    st, units = remove_response(st, inv, cfg, taper_max_s=cfg.seis_pad_s or None,
+                                verbose=verbose)
+    if fs_out:
+        st = retarget_rate(st, fs_out)
+    t0, t1 = window_of(cfg)
+    if t0 is not None:
+        st.trim(t0, t1)
+    st.merge(method=1, fill_value=None)
+    return st[0], units, inv, stations
+
+
+def check_overlap(cfg, stations: dict):
+    t0, t1 = window_of(cfg)
+    d = das_coverage(cfg)
+    s = seismic_coverage(stations)
+    print(f"  DAS coverage   : {d['start']} -> {d['end']} ({d['n_files']} files, "
+          f"{len(d['gaps'])} gap(s))")
+    for sid, (a, b, n) in sorted(s.items()):
+        print(f"  seis coverage  : {sid:18s} {a} -> {b} ({n} file(s))")
+    if t0 is None:
+        return
+    if d["start"] is not None and (t1 <= d["start"] or t0 >= d["end"]):
+        raise SystemExit("the configured window does not intersect the DAS data")
+    if s and all(t1 <= a or t0 >= b for a, b, _n in s.values()):
+        raise SystemExit("the configured window does not intersect the seismic data")
+
+
+def c_app_of(cfg):
+    if cfg.c_app_curve:
+        d = np.loadtxt(cfg.c_app_curve, delimiter=",", comments="#", ndmin=2)
+        o = np.argsort(d[:, 0])
+        f, c = d[o, 0], d[o, 1]
+        return lambda fq: np.interp(np.asarray(fq, float), f, c, left=c[0], right=c[-1])
+    val = float(cfg.c_app)
+    return lambda fq: np.full(np.shape(fq), val, dtype=float)
+
+
+def gauge_sinc(f, gauge_length, c_of_f):
+    c = np.asarray(c_of_f(f), dtype=float)
+    arg = np.pi * np.asarray(f, float) * gauge_length / np.where(c <= 0, np.nan, c)
+    out = np.ones_like(arg)
+    nz = arg != 0
+    out[nz] = np.sin(arg[nz]) / arg[nz]
+    return np.abs(out)
+
+
+def _spectral_op(x, fs, op):
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    X = rfft(x, axis=0)
+    H = np.asarray(op(rfftfreq(n, d=1.0 / fs)))
+    if x.ndim == 2:
+        H = H[:, None]
+    return irfft(X * H, n=n, axis=0)
+
+
+def strain_to_acceleration(eps, fs, cfg, gauge_length=None):
+    c_of_f = c_app_of(cfg)
+    gl = gauge_length or cfg.gauge_length
+
+    def op(f):
+        H = -c_of_f(f) * (1j * 2.0 * np.pi * f) / float(cfg.obliquity or 1.0)
+        if cfg.gauge_correct:
+            H = H / np.maximum(gauge_sinc(f, gl, c_of_f), cfg.gauge_water)
+        return H
+    return _spectral_op(eps, fs, op)
+
+
+def seis_to_acceleration(d, fs, units):
+    w_op = {"VEL": lambda f: 1j * 2 * np.pi * f,
+            "DISP": lambda f: (1j * 2 * np.pi * f) ** 2,
+            "ACC": lambda f: np.ones_like(f) + 0j,
+            "COUNTS": lambda f: np.ones_like(f) + 0j}
+    if units not in w_op:
+        raise SystemExit(f"cannot convert {units} to acceleration")
+    return _spectral_op(d, fs, w_op[units])
+
+
+def load_das_point_trace(cfg, fs_out, verbose=True):
+    ch = int(cfg.das_channels[0])
+    st, meta = read_das_window(cfg, [ch], fs_out, verbose)
+    return st[0], meta
+
+
+def fractional_delay(x, frac):
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    nfft = next_fast_len(n + 64)
+    X = rfft(x, n=nfft, axis=0)
+    ph = np.exp(-2j * np.pi * rfftfreq(nfft) * frac)
+    return irfft(X * (ph if x.ndim == 1 else ph[:, None]), n=nfft, axis=0)[:n]
+
+
+def snap_to_grid(st, anchor, fs, verbose=True):
+    anchor = UTCDateTime(anchor)
+    out = Stream()
+    worst = 0.0
+    for tr in st.copy().split():
+        if abs(tr.stats.sampling_rate - fs) > 1e-6:
+            out += tr
+            continue
+        pos = (tr.stats.starttime - anchor) * fs
+        delta = pos - np.floor(pos)
+        if delta > 0.5:
+            delta -= 1.0
+        if abs(delta) > 1e-3:
+            tr.data = fractional_delay(tr.data, delta)
+            tr.stats.starttime = tr.stats.starttime - delta / fs
+            worst = max(worst, abs(delta))
+        out += tr
+    out.merge(method=1, fill_value=None)
+    if verbose and worst:
+        print(f"  grid snap      : seismometer shifted by up to {worst:.3f} sample "
+              f"({1e3 * worst / fs:.2f} ms) onto the DAS sample grid")
+    return out
+
+
+def align_pair(tr_a, tr_b, fs):
+    a = retarget_rate(Stream([tr_a.copy()]), fs)
+    b = retarget_rate(Stream([tr_b.copy()]), fs)
+    b = snap_to_grid(b, a[0].stats.starttime, fs)
+    a.merge(method=1, fill_value=None)
+    b.merge(method=1, fill_value=None)
+    a, b = a[0], b[0]
+    if abs(a.stats.sampling_rate - b.stats.sampling_rate) > 1e-6:
+        raise SystemExit(f"rates differ after resampling: {a.stats.sampling_rate} vs "
+                         f"{b.stats.sampling_rate}")
+    t0 = max(a.stats.starttime, b.stats.starttime)
+    t1 = min(a.stats.endtime, b.stats.endtime)
+    if t1 - t0 <= 0:
+        raise SystemExit(f"DAS ({a.stats.starttime} -> {a.stats.endtime}) and "
+                         f"seismometer ({b.stats.starttime} -> {b.stats.endtime}) "
+                         f"do not overlap")
+    out = []
+    n = int(np.floor((t1 - t0) * fs)) + 1
+    for tr in (a, b):
+        i0 = int(round((t0 - tr.stats.starttime) * fs))
+        d = trace_data(tr)[i0:i0 + n]
+        out.append(d)
+    n = min(len(out[0]), len(out[1]))
+    da, ds = out[0][:n], out[1][:n]
+    gap = float(np.mean(~np.isfinite(da) | ~np.isfinite(ds)))
+    if gap > 0:
+        print(f"  ! {100 * gap:.1f}% of the common span is a gap on one side; "
+              f"gaps are zero-filled for the spectra")
+    print(f"  aligned        : {t0} -> {t0 + (n - 1) / fs}  ({n / fs / 60:.2f} min @ "
+          f"{fs:g} Hz)")
+    return np.nan_to_num(da), np.nan_to_num(ds), t0, t0 + (n - 1) / fs, gap
+
+
+def load_aligned_pair(cfg, verbose=True):
+    info = probe_das(cfg)
+    stations = prepare_seismic(cfg, [cfg.seis_station] if cfg.seis_station else [],
+                               verbose)
+    check_overlap(cfg, stations)
+    tr_seis, units, _inv, _st = load_point_seismic(cfg, None, verbose, stations)
+    fs = common_rate(info["fs_raw"], tr_seis.stats.sampling_rate, cfg.fs_target)
+    print(f"  common rate    : {fs:g} Hz (DAS {info['fs_raw']:g} Hz, seismometer "
+          f"{tr_seis.stats.sampling_rate:g} Hz, fs_target {cfg.fs_target})")
+    print("  -- DAS: read Sintela HDF5 (h5py)")
+    tr_das, meta = load_das_point_trace(cfg, fs, verbose)
+    eps, seis, t0, t1, _gap = align_pair(tr_das, tr_seis, fs)
+    return eps, seis, fs, t0, t1, units, trace_id(tr_das), trace_id(tr_seis), meta, tr_das, tr_seis
+
+
+class TimeGrid:
+    def __init__(self, t_ref, bin_s, n_bins):
+        self.t_ref, self.bin_s, self.n_bins = UTCDateTime(t_ref), float(bin_s), int(n_bins)
+
+    def index(self, t):
+        return int(np.floor((UTCDateTime(t) - self.t_ref) / self.bin_s))
+
+    def start_of(self, i):
+        return self.t_ref + i * self.bin_s
+
+    def centres_dt(self):
+        return [(self.t_ref + (i + 0.5) * self.bin_s).datetime for i in range(self.n_bins)]
+
+
+class GriddedSpectra:
+
+    def __init__(self, grid, fs, spec_win_s, env_band, min_coverage=0.9):
+        self.grid, self.fs, self.min_coverage = grid, float(fs), min_coverage
+        nper = int(2 ** np.round(np.log2(max(8.0, spec_win_s * fs))))
+        self.nper = int(max(8, min(nper, int(grid.bin_s * fs))))
+        self.freqs = np.fft.rfftfreq(self.nper, d=1.0 / fs)
+        nyq = fs / 2.0
+        lo, hi = max(env_band[0], 1e-6), min(env_band[1], 0.95 * nyq)
+        self.sos = (signal.butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
+                    if hi > lo else None)
+        self.psd = np.full((grid.n_bins, self.freqs.size), np.nan)
+        self.rms = np.full(grid.n_bins, np.nan)
+        self.buf = self.t_buf = None
+        self.n_filled = 0
+
+    def feed(self, x, t0):
+        x = np.asarray(x, np.float64).ravel()
+        if x.size == 0:
+            return
+        t0 = UTCDateTime(t0)
+        if self.buf is None:
+            self.buf, self.t_buf = x, t0
+        elif abs(t0 - (self.t_buf + self.buf.size / self.fs)) > 0.5 / self.fs:
+            self.buf, self.t_buf = x, t0
+        else:
+            self.buf = np.concatenate([self.buf, x])
+        self._drain()
+
+    def _drain(self):
+        while self.buf is not None and self.buf.size:
+            i = self.grid.index(self.t_buf)
+            bin_end = self.grid.start_of(i + 1)
+            need = int(round((bin_end - self.t_buf) * self.fs))
+            if need <= 0:
+                self.buf = self.t_buf = None
+                return
+            if self.buf.size < need:
+                return
+            seg = self.buf[:need]
+            if (0 <= i < self.grid.n_bins and
+                    seg.size >= self.min_coverage * self.grid.bin_s * self.fs and
+                    np.all(np.isfinite(seg))):
+                nper = int(min(self.nper, seg.size))
+                f, p = signal.welch(seg, fs=self.fs, nperseg=nper, noverlap=nper // 2,
+                                    detrend="linear", scaling="density")
+                self.psd[i] = p if f.size == self.freqs.size else np.interp(self.freqs, f, p)
+                b = signal.sosfiltfilt(self.sos, seg) if self.sos is not None else seg
+                self.rms[i] = float(np.sqrt(np.mean(b ** 2)))
+                self.n_filled += 1
+            self.buf = self.buf[need:]
+            self.t_buf = bin_end
+
+
+def pick_seis_id(cfg, stations):
+    cov = seismic_coverage(stations)
+    ids = sorted(cov)
+    if not ids:
+        raise SystemExit("no converted seismic data found")
+    if cfg.seis_select:
+        tok = str(cfg.seis_select)
+        ids = [i for i in ids if tok == i or tok in i]
+    if cfg.seis_station:
+        ids = [i for i in ids if i.split(".")[1].upper() == str(cfg.seis_station).upper()]
+    comp = (cfg.seis_component or "").upper()
+    if comp:
+        hit = [i for i in ids if i.split(".")[-1].upper().endswith(comp)]
+        if not hit:
+            raise SystemExit(f"component {comp!r} not identifiable in {ids}; set "
+                             f"seis_select to the exact SEED id")
+        ids = hit
+    if not ids:
+        raise SystemExit(f"seis_select/seis_station match none of {sorted(cov)}")
+    if len(ids) > 1:
+        print(f"  ! several ids match {ids}; using {ids[0]}")
+    return ids[0]
+
+
+def accumulate_das(cfg, grid):
+    gs, meta = None, {}
+    for block, t0, fs, _c, meta in stream_das_blocks(cfg, [int(cfg.das_channels[0])],
+                                                     cfg.fs_target, True):
+        if gs is None:
+            gs = GriddedSpectra(grid, fs, cfg.spec_win_s, (cfg.env_fmin, cfg.env_fmax))
+        gs.feed(block[:, 0], t0)
+    if gs is None:
+        raise SystemExit("no DAS data in that window")
+    gs._drain()
+    return gs, meta
+
+
+def accumulate_seis(cfg, grid, seed_id, stations, inv, chunk_s=1800.0, pad_s=60.0):
+    t0w, t1w = window_of(cfg)
+    rows = sorted([r for info in stations.values() for r in _converted_rows(info)
+                   if r[0] == seed_id and r[2] >= t0w - pad_s and r[1] <= t1w + pad_s],
+                  key=lambda r: r[1])
+    gs, units = None, "COUNTS"
+    state = {"buf": Stream(), "end": None, "last": None}
+
+    def ensure(fs):
+        nonlocal gs
+        if gs is None:
+            gs = GriddedSpectra(grid, fs, cfg.spec_win_s, (cfg.env_fmin, cfg.env_fmax))
+        return gs
+
+    def flush(final):
+        nonlocal units
+        buf = state["buf"]
+        if not len(buf):
+            return
+        work = buf.copy()
+        work.merge(method=1, fill_value=None)
+        work, units = remove_response(work, inv, cfg, taper_max_s=pad_s, verbose=False)
+        if not len(work):
+            state["buf"] = Stream()
+            return
+        t_end = max(tr.stats.endtime for tr in work)
+        t_beg = min(tr.stats.starttime for tr in work)
+        cut = t_end if final else t_end - pad_s
+        for tr in work.slice(t_beg, cut, nearest_sample=False).split():
+            if tr.stats.npts < 2:
+                continue
+            g = ensure(tr.stats.sampling_rate)
+            if abs(tr.stats.sampling_rate - g.fs) > 1e-6:
+                continue
+            last = state["last"]
+            if last is not None and tr.stats.starttime <= last:
+                new_start = last + 1.0 / tr.stats.sampling_rate
+                if new_start > tr.stats.endtime:
+                    continue
+                tr = tr.copy().trim(new_start, tr.stats.endtime, nearest_sample=True)
+                if tr.stats.npts < 2:
+                    continue
+            g.feed(np.nan_to_num(trace_data(tr)), tr.stats.starttime)
+            state["last"] = tr.stats.endtime
+        if final:
+            state["buf"], state["end"] = Stream(), None
+        else:
+            state["buf"], state["end"] = buf.copy().slice(cut, t_end), t_end
+
+    prog = Progress("seismic files", len(rows))
+    for i, (_sid, _a, _b, path) in enumerate(rows):
+        try:
+            st = read(path).select(id=seed_id)
+        except Exception as exc:
+            print(f"  ! skip {os.path.basename(path)}: {exc}")
+            continue
+        for tr in st:
+            tr.data = tr.data.astype(np.float64)
+        st.merge(method=1, fill_value=None)
+        st.trim(t0w - pad_s, t1w + pad_s)
+        st = Stream([tr for tr in st if tr.stats.npts > 0])
+        if not len(st):
+            continue
+        tb = min(tr.stats.starttime for tr in st)
+        if state["end"] is not None and abs(tb - state["end"]) > 1.0:
+            flush(True)
+        state["buf"] += st
+        state["end"] = max(tr.stats.endtime for tr in st)
+        if state["end"] - min(tr.stats.starttime for tr in state["buf"]) >= chunk_s:
+            flush(False)
+        prog.step(i)
+    flush(True)
+    if gs is None:
+        raise SystemExit(f"no seismic data for {seed_id} in that window")
+    gs._drain()
+    return gs, units
+
+
+def to_acceleration_psd(psd, freqs, kind, cfg):
+    w = 2 * np.pi * freqs
+    if kind == "STRAIN":
+        g = (w * c_app_of(cfg)(freqs)) ** 2 / float(cfg.obliquity or 1.0) ** 2
+    elif kind == "VEL":
+        g = w ** 2
+    elif kind == "DISP":
+        g = w ** 4
+    else:
+        g = np.ones_like(w)
+    return psd * g[None, :]
+
+
+def to_velocity_psd(psd, freqs, kind, cfg):
+    w = 2 * np.pi * freqs
+    if kind == "STRAIN":
+        g = c_app_of(cfg)(freqs) ** 2 / float(cfg.obliquity or 1.0) ** 2
+    elif kind == "ACC":
+        g = np.full_like(w, np.nan)
+        g[w != 0] = 1.0 / w[w != 0] ** 2
+    elif kind == "DISP":
+        g = w ** 2
+    else:
+        g = np.ones_like(w)
+    return psd * g[None, :]
+
+
+def band_rms(psd, freqs, lo, hi):
+    sel = (freqs >= lo) & (freqs <= min(hi, freqs[-1]))
+    if sel.sum() < 2:
+        sel = freqs > 0
+    df = np.gradient(freqs)
+    allnan = np.all(np.isnan(psd[:, sel]), axis=1)
+    out = np.sqrt(np.nansum(psd[:, sel] * df[None, sel], axis=1))
+    out[allnan] = np.nan
+    return out
+
+
+def _cache_sig(cfg, seed_id):
+    return repr(sorted(dict(
+        das_dir=str(cfg.das_dir), start=str(window_of(cfg)[0]), end=str(window_of(cfg)[1]),
+        bin=float(cfg.bin_s), win=float(cfg.spec_win_s), env=(cfg.env_fmin, cfg.env_fmax),
+        fs=str(cfg.fs_target), ch=int(cfg.das_channels[0]), raw=str(cfg.das_raw_units),
+        scale=float(cfg.das_raw_scale), gl=float(cfg.gauge_length), sid=seed_id,
+        out=str(cfg.seis_output), rr=bool(cfg.seis_remove_response),
+        wl=float(cfg.water_level), pf=tuple(cfg.pre_filt or []),
+        inv=repr(sorted((cfg.inventory or {}).items()))).items()))
+
+
+def build_timeline(cfg, use_cache=True, rebuild=False):
+    t0w, t1w = window_of(cfg)
+    if t0w is None:
+        raise SystemExit("start_utc is required for a timeline")
+    n_bins = int(np.ceil((t1w - t0w) / cfg.bin_s))
+    if n_bins < 3:
+        raise SystemExit(f"only {n_bins} bins of {cfg.bin_s:g} s -- lower bin_s")
+    grid = TimeGrid(t0w, cfg.bin_s, n_bins)
+    stations = prepare_seismic(cfg, [cfg.seis_station] if cfg.seis_station else [])
+    check_overlap(cfg, stations)
+    seed_id = pick_seis_id(cfg, stations)
+    print(f"  seismic id     : {seed_id}")
+    print(f"  grid           : {n_bins} bins of {cfg.bin_s:g} s from {t0w}")
+    cache = os.path.join(cfg.cache_dir, f"{cfg.out_prefix}_timeline_cache.npz")
+    sig = _cache_sig(cfg, seed_id)
+    if use_cache and not rebuild and os.path.exists(cache):
+        try:
+            z = np.load(cache, allow_pickle=False)
+            if str(z["signature"].item()) == sig:
+                das = SimpleNamespace(freqs=z["das_freqs"], psd=z["das_psd"],
+                                      rms=z["das_rms"], fs=float(z["das_fs"]),
+                                      n_filled=int(z["das_n"]))
+                seis = SimpleNamespace(freqs=z["seis_freqs"], psd=z["seis_psd"],
+                                       rms=z["seis_rms"], fs=float(z["seis_fs"]),
+                                       n_filled=int(z["seis_n"]))
+                meta = dict(channels=[int(cfg.das_channels[0])],
+                            gauge_length=float(z["gl"]), dx=float(z["dx"]))
+                print(f"  cache reused   : {cache}")
+                return dict(grid=grid, das=das, seis=seis, meta=meta,
+                            seis_units=str(z["units"].item()), seed_id=seed_id,
+                            n_bins=n_bins)
+            print("  cache          : settings changed -> rebuilding")
+        except Exception as exc:
+            print(f"  ! cache unreadable ({exc}); rebuilding")
+    print("  -- DAS: streaming Sintela HDF5 onto the grid")
+    das, meta = accumulate_das(cfg, grid)
+    print(f"  DAS bins       : {das.n_filled}/{n_bins}")
+    print("  -- seismic step 3: streaming MiniSEED onto the grid (response removed "
+          "per 30-min chunk)")
+    chan = seed_id.split(".")[-1]
+    inv = load_station_inventory(cfg, stations, chan)
+    seis, units = accumulate_seis(cfg, grid, seed_id, stations, inv)
+    print(f"  seismic bins   : {seis.n_filled}/{n_bins} ({units})")
+    if use_cache:
+        np.savez_compressed(cache, signature=np.array(sig), das_freqs=das.freqs,
+                            das_psd=das.psd, das_rms=das.rms, das_fs=das.fs,
+                            das_n=das.n_filled, seis_freqs=seis.freqs,
+                            seis_psd=seis.psd, seis_rms=seis.rms, seis_fs=seis.fs,
+                            seis_n=seis.n_filled, units=np.array(units),
+                            gl=meta["gauge_length"], dx=meta["dx"])
+        print(f"  cache written  : {cache}")
+    if das.n_filled == 0 or seis.n_filled == 0:
+        raise SystemExit("one side filled no bins -- check the window")
+    return dict(grid=grid, das=das, seis=seis, meta=meta, seis_units=units,
+                seed_id=seed_id, n_bins=n_bins)
+
+
+def timeline_envelopes(tl, cfg, quantity):
+    das, seis, u = tl["das"], tl["seis"], tl["seis_units"]
+    conv = to_acceleration_psd if quantity == "ACC" else to_velocity_psd
+    dp = conv(das.psd, das.freqs, "STRAIN", cfg)
+    sp = conv(seis.psd, seis.freqs, u, cfg)
+    return (dp, sp, band_rms(dp, das.freqs, cfg.env_fmin, cfg.env_fmax),
+            band_rms(sp, seis.freqs, cfg.env_fmin, cfg.env_fmax))
+
+
+_SHARED = {
+    "START_TIME":         ("start_utc",          None),
+    "END_TIME":           ("end_utc",            None),
+    "DAS_FOLDER":         ("das_dir",            None),
+    "DAS_PATTERN":        ("das_pattern",        "*.h5"),
+    "DAS_CHANNEL":        ("das_channels",       None),
+    "DAS_RAW_UNITS":      ("das_raw_units",      "phase"),
+    "DAS_RAW_SCALE":      ("das_raw_scale",      1.0),
+    "GAUGE_LENGTH_M":     ("gauge_length",       None),
+    "DX_M":               ("dx",                 None),
+    "SEIS_ROOT":          ("seis_root",          None),
+    "SEIS_STATION":       ("seis_station",       None),
+    "SEIS_SELECT":        ("seis_select",        None),
+    "SEIS_KEEP_CHANNELS": ("seis_keep_channels", "CHZ,CH1,CH2"),
+    "SEIS_CONVERT":       ("seis_convert",       True),
+    "SEIS_ASSUME_FORMAT": ("seis_assume_format", None),
+    "CONVERTED_SUBDIR":   ("converted_subdir",   "converted_mseed"),
+    "RESPONSE_FILE":      ("inventory",          None),
+    "SEIS_OUTPUT":        ("seis_output",        "VEL"),
+    "WATER_LEVEL":        ("water_level",        60.0),
+    "PRE_FILT":           ("pre_filt",           (0.01, 0.02, 45.0, 50.0)),
+    "SEIS_PAD_SEC":       ("seis_pad_s",         120.0),
+    "C_APP":              ("c_app",              420.0),
+    "C_APP_CURVE":        ("c_app_curve",        None),
+    "BIN_SEC":            ("bin_s",              60.0),
+    "SPEC_WIN_SEC":       ("spec_win_s",         60.0),
+    "RMS_FMIN":           ("env_fmin",           1.0),
+    "RMS_FMAX":           ("env_fmax",           20.0),
+    "F_MIN":              ("fmin",               0.05),
+    "F_MAX":              ("fmax",               50.0),
+    "LAG_MAX_SEC":        ("lag_max_s",          300.0),
+    "OUTPUT_FOLDER":      ("outdir",             None),
+    "CACHE_FOLDER":       ("cache_dir",          None),
+    "OUT_PREFIX":         ("out_prefix",         "sintela_seis"),
+    "INDEX_OUTPUT":       ("index_output",       True),
+    "USE_CACHE":          ("use_cache",          True),
+    "REBUILD_CACHE":      ("rebuild_cache",      False),
+    "MAX_MEMORY_MB":      ("max_memory_mb",      4000.0),
+    "DPI_SAVE":           ("dpi",                200),
+    "FIG_SIZE":           ("fig_size",           (15, 6)),
+    "QUANTITY":           ("quantity",           "ACC"),
+    "EVENT_TIME":         ("event_utc",          None),
+    "EVENT_WIN_SEC":      ("event_win_s",        20.0),
+    "EVENT_PAD_SEC":      ("event_pad_s",        30.0),
+    "EVENT_LAG_MAX_SEC":  ("event_lag_max_s",    2.0),
+    "EVENT_AUTO_POLARITY": ("event_auto_polarity", True),
+    "C_FK_CSV":           ("c_fk_csv",           None),
+}
+_REQUIRED = ("START_TIME", "END_TIME", "DAS_FOLDER", "DAS_CHANNEL", "SEIS_ROOT", "SEIS_SELECT",
+             "OUTPUT_FOLDER")
+
+
+def settings_from(g: dict, description: str = "") -> Config:
+    ap = argparse.ArgumentParser(description=description)
+    ap.add_argument("--start", help="override START_TIME, e.g. '2025-07-18 17:00:00'")
+    ap.add_argument("--end", help="override END_TIME")
+    ap.add_argument("--rebuild", action="store_true", help="rebuild the timeline cache")
+    a, _ = ap.parse_known_args()
+    missing = [k for k in _REQUIRED if g.get(k) in (None, "")]
+    if missing:
+        raise SystemExit(f"set {', '.join(missing)} at the top of the script")
+    kw = {}
+    for name, (key, default) in _SHARED.items():
+        kw[key] = g.get(name, default)
+    kw["start_utc"] = str(a.start or kw["start_utc"]).strip().replace(" ", "T")
+    kw["end_utc"] = str(a.end or kw["end_utc"]).strip().replace(" ", "T")
+    try:
+        t0, t1 = UTCDateTime(kw["start_utc"]), UTCDateTime(kw["end_utc"])
+    except Exception as exc:
+        raise SystemExit(f"cannot read START_TIME / END_TIME: {exc}")
+    if t1 <= t0:
+        raise SystemExit(f"END_TIME {t1} is not after START_TIME {t0}")
+    kw["rebuild_cache"] = bool(kw["rebuild_cache"] or a.rebuild)
+    ch = kw["das_channels"]
+    kw["das_channels"] = [int(c) for c in ch] if isinstance(ch, (list, tuple)) else [int(ch)]
+    if kw["gauge_length"] is None:
+        kw["gauge_length"] = float("nan")
+    kw["pre_filt"] = list(kw["pre_filt"]) if kw["pre_filt"] else None
+    sta = str(kw["seis_station"] or str(kw["seis_select"]).split(".")[1]).upper()
+    kw["seis_station"] = sta
+    resp = kw["inventory"]
+    kw["inventory"] = {sta: resp} if resp else "auto"
+    kw["fig_width"], kw["fig_height"] = (float(v) for v in kw["fig_size"])
+    kw["cache_dir"] = kw["cache_dir"] or kw["outdir"]
+    kw.update(das_net_code="DA", seis_station_dirs={}, seis_component=None,
+              component_azimuth_tolerance_deg=35.0, seis_remove_response=True,
+              fs_target=None, obliquity=1.0, gauge_correct=False, gauge_water=0.2,
+              acc_db_range=None, vel_db_range=None)
+    os.makedirs(kw["outdir"], exist_ok=True)
+    os.makedirs(kw["cache_dir"], exist_ok=True)
+    return Config(**kw)
+
+
+def fallback_gauge_length(cfg, value):
+    if np.isfinite(value) and value > 0:
+        return float(value)
+    if cfg.gauge_length and np.isfinite(cfg.gauge_length):
+        return float(cfg.gauge_length)
+    raise SystemExit("the DAS files have no GaugeLength: set GAUGE_LENGTH_M")
+
+
+def rms_series(tl, cfg, quantity):
+    if tl["seis_units"] not in ("VEL", "ACC", "DISP"):
+        raise SystemExit("the seismometer is in COUNTS (no response removed): amplitudes cannot "
+                         "be compared. Check RESPONSE_FILE.")
+    _dp, _sp, d, s = timeline_envelopes(tl, cfg, quantity)
+    return d, s
+
+
+def pick_event(cfg, grid, da, sa):
+    if cfg.event_utc:
+        return UTCDateTime(str(cfg.event_utc).replace(" ", "T")), "EVENT_TIME"
+    ok = np.isfinite(da) & np.isfinite(sa) & (da > 0) & (sa > 0)
+    if not ok.any():
+        raise SystemExit("no bin with data from both instruments")
+
+    def contrast(x, half=5):
+        lx = np.where(ok, np.log10(np.where(x > 0, x, np.nan)), np.nan)
+        out = np.full(len(x), np.nan)
+        for i in np.flatnonzero(ok):
+            nb = np.r_[lx[max(0, i - half):i], lx[i + 1:i + 1 + half]]
+            nb = nb[np.isfinite(nb)]
+            if nb.size >= 2:
+                out[i] = 10 ** (lx[i] - np.median(nb))
+        return out
+    score = np.fmin(contrast(da), contrast(sa))
+    if not np.isfinite(score).any():
+        score = np.where(ok, np.fmin(da / np.nanmedian(da[ok]), sa / np.nanmedian(sa[ok])), np.nan)
+    i = int(np.nanargmax(score))
+    return (grid.start_of(i) + 0.5 * grid.bin_s,
+            f"auto: strongest transient seen by both ({score[i]:.1f} x local background)")
+
+
+def event_waveforms(cfg, t_centre):
+    half = 0.5 * float(cfg.bin_s) + float(cfg.event_pad_s)
+    ec = Config(**vars(cfg))
+    ec.start_utc, ec.end_utc = str(t_centre - half), str(t_centre + half)
+    print(f"  -- event       : reading {ec.start_utc} -> {ec.end_utc} at the native rate", flush=True)
+    eps, seis, fs, t0, _t1, units, das_id, seis_id, _m, _a, _b = load_aligned_pair(ec, verbose=False)
+    if units not in ("VEL", "ACC", "DISP"):
+        raise SystemExit("the event panel needs the seismometer response removed (units are COUNTS)")
+    a_das = np.asarray(strain_to_acceleration(eps, fs, cfg), dtype=np.float64)
+    a_seis = np.asarray(seis_to_acceleration(seis, fs, units), dtype=np.float64)
+    nyq = fs / 2.0
+    lo, hi = float(cfg.env_fmin), min(float(cfg.env_fmax), 0.45 * fs)
+    sos = signal.butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
+    tap = signal.windows.tukey(len(a_das), 0.1)
+    a_das = signal.sosfiltfilt(sos, (a_das - np.mean(a_das)) * tap)
+    a_seis = signal.sosfiltfilt(sos, (a_seis - np.mean(a_seis)) * tap)
+    t = np.arange(len(a_das)) / fs
+    w = max(1, int(round(0.5 * fs)))
+    env = sum(uniform_filter1d(np.abs(x), w) / (np.max(np.abs(x)) + 1e-30) for x in (a_das, a_seis))
+    in_bin = (t >= float(cfg.event_pad_s)) & (t <= float(cfg.event_pad_s) + float(cfg.bin_s))
+    k_pk = int(np.argmax(np.where(in_bin, env, -1)))
+    nwin = int(round(float(cfg.event_win_s) * fs))
+    i0 = int(np.clip(k_pk - nwin // 2, 0, max(0, len(t) - nwin)))
+    x, y = a_das[i0:i0 + nwin], a_seis[i0:i0 + nwin]
+    xn, yn = x - np.mean(x), y - np.mean(y)
+    nrm = np.sqrt(np.sum(xn ** 2) * np.sum(yn ** 2)) + 1e-30
+    cc = signal.correlate(xn, yn, mode="full") / nrm
+    lags = signal.correlation_lags(len(xn), len(yn), mode="full")
+    sel = np.abs(lags) <= int(round(float(cfg.event_lag_max_s) * fs))
+    cc, lags = cc[sel], lags[sel]
+    k = int(np.argmax(np.abs(cc)))
+    lag = float(lags[k])
+    if 0 < k < len(cc) - 1:
+        y0, y1, y2 = np.abs(cc[k - 1:k + 2])
+        den = y0 - 2 * y1 + y2
+        if den != 0:
+            lag += float(np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5))
+    r0 = float(cc[lags == 0][0]) if np.any(lags == 0) else np.nan
+    flipped = bool(cfg.event_auto_polarity and cc[k] < 0)
+    if flipped:
+        x = -x
+    return dict(t0=t0 + i0 / fs, fs=fs, das=x, seis=y, lag_s=lag / fs, r_best=float(abs(cc[k])),
+                r_zero=(-r0 if flipped else r0), flipped=flipped, das_id=das_id, seis_id=seis_id,
+                rms_ratio=float(np.sqrt(np.mean(x ** 2)) / (np.sqrt(np.mean(y ** 2)) + 1e-30)),
+                band=(lo, hi), cc_lags=lags / fs, cc=(-cc if flipped else cc))
+
+
+def save_figure(fig, cfg, suffix):
+    stem, _ = out_path(cfg, suffix)
+    fig.savefig(stem + ".png", dpi=cfg.dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {stem}.png", flush=True)
+    return stem
+
+
+def main():
+    cfg = settings_from(globals(), __doc__)
+    banner("Sintela DAS vs seismometer: event waveforms", cfg,
+             {"DAS channel": cfg.das_channels[0], "seismometer": cfg.seis_select,
+              "event": cfg.event_utc or "automatic"})
+    if cfg.event_utc:
+        t_ev, why = UTCDateTime(str(cfg.event_utc).replace(" ", "T")), "EVENT_TIME"
+    else:
+        tl = build_timeline(cfg, cfg.use_cache, cfg.rebuild_cache)
+        d, s = rms_series(tl, cfg, "ACC")
+        t_ev, why = pick_event(cfg, tl["grid"], d, s)
+    print(f"  event centre   : {t_ev} ({why})", flush=True)
+    ev = event_waveforms(cfg, t_ev)
+    fig = plt.figure(figsize=(cfg.fig_width, cfg.fig_height))
+    outer = fig.add_gridspec(2, 1, height_ratios=[2.0, 0.8], hspace=0.38)
+    top = outer[0].subgridspec(2, 1, hspace=0.08)
+    a1 = fig.add_subplot(top[0])
+    a2 = fig.add_subplot(top[1], sharex=a1, sharey=a1)
+    a3 = fig.add_subplot(outer[1])
+    tt = np.arange(len(ev["das"])) / ev["fs"]
+    a1.plot(tt, ev["das"] * 1e3, color="tab:red", lw=0.7)
+    a2.plot(tt, ev["seis"] * 1e3, color="tab:blue", lw=0.7)
+    m = 1.1 * max(np.max(np.abs(ev["das"])), np.max(np.abs(ev["seis"]))) * 1e3
+    a1.set_ylim(-m, m)
+    a1.set_ylabel(f"DAS ch{cfg.das_channels[0]}" + (" \u00d7(\u22121)" if ev["flipped"] else "")
+                  + "\n[mm/s$^2$]")
+    a2.set_ylabel(f"{ev['seis_id']}\n[mm/s$^2$]")
+    plt.setp(a1.get_xticklabels(), visible=False)
+    a2.set_xlabel(f"seconds after {ev['t0'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-4]} UTC")
+    for a in (a1, a2):
+        a.grid(alpha=0.3)
+        a.set_xlim(tt[0], tt[-1])
+    lag_ms = round(1e3 * ev["lag_s"]) + 0.0
+    a1.set_title(f"Do both instruments record the same waveform?   acceleration, "
+                 f"{ev['band'][0]:g}-{ev['band'][1]:g} Hz, {ev['fs']:g} Hz, C_APP {cfg.c_app:g} m/s\n"
+                 f"zero-lag r = {ev['r_zero']:.2f}   |   best r = {ev['r_best']:.2f} at {lag_ms:+.0f} ms "
+                 f"(+ = DAS late)   |   RMS DAS/seis = {ev['rms_ratio']:.2f}   |   {why}", fontsize=10)
+    if ev["flipped"]:
+        a2.text(0.01, 0.04, "DAS polarity reversed for display (propagation direction / sensor orientation)",
+                transform=a2.transAxes, fontsize=8, color="0.3")
+    a3.plot(ev["cc_lags"] * 1e3, ev["cc"], color="tab:green", lw=1)
+    a3.axvline(0, color="k", lw=0.8)
+    a3.axvline(1e3 * ev["lag_s"], color="tab:green", ls="--", lw=0.8)
+    a3.set_xlim(-1e3 * cfg.event_lag_max_s, 1e3 * cfg.event_lag_max_s)
+    a3.set_xlabel("lag of DAS relative to the seismometer [ms] (+ = DAS late)")
+    a3.set_ylabel("corr.")
+    a3.grid(alpha=0.3)
+    stem = save_figure(fig, cfg, "event_waveform")
+    np.savez_compressed(stem + ".npz", t0=str(ev["t0"]), fs=ev["fs"], das_acc=ev["das"],
+                        seis_acc=ev["seis"], lag_s=ev["lag_s"], r_zero=ev["r_zero"],
+                        r_best=ev["r_best"], das_flipped=ev["flipped"])
+    print(f"  wrote {stem}.npz")
+    print(f"  zero-lag r = {ev['r_zero']:.3f}; best r = {ev['r_best']:.3f} at {1e3 * ev['lag_s']:+.1f} ms; "
+          f"RMS DAS/seis = {ev['rms_ratio']:.3f}" + ("; DAS polarity reversed" if ev["flipped"] else ""))
+
+
+if __name__ == "__main__":
+    main()
