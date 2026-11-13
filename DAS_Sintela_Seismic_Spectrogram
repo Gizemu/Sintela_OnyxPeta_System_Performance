@@ -1,0 +1,2275 @@
+# Author: Gizem Karslioglu
+import os
+import re
+import io
+import glob
+import gzip
+import json
+import time
+import hashlib
+import datetime
+import argparse
+
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+import numpy as np
+import h5py
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
+
+START_TIME          = "2025-07-18 15:00:00"
+END_TIME            = "2025-07-18 20:00:00"
+WINDOW_NAME         = "2025-07-18_1500_2000"
+DATA_FOLDER         = r"/Volumes/X9 Pro/1-Sintela_July2025/Sintela July 18"
+DATA_FILES          = []
+FILE_PATTERN        = "*.h5"
+RECURSIVE           = False
+CABLE               = "Sintela"
+SELECTED_DIST_M     = 475.0
+SELECTED_CHANNEL    = None
+DISTANCE_OFFSET_M   = None
+SEIS_FOLDER         = r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02"
+SEIS_PATTERN        = "*.gz"
+SEIS_CONVERTED_FOLDER = r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02/converted_mseed"
+SEIS_NETWORK        = "*"
+SEIS_STATION        = "ST02"
+SEIS_LOCATION       = "*"
+SEIS_CHANNEL        = "CH2"
+RESPONSE_FILE       = [r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02/ST02_*.xml"]
+RESPONSE_MATCH      = "exact"
+OUTPUT_FOLDER       = r"/Volumes/X9 Pro/1-Sintela_July2025/Sintela July 18/output_das_seismic_spectrogram"
+CACHE_FOLDER        = r"/Volumes/X9 Pro/1-Sintela_July2025/cache_spectrogram_sintela"
+LEGACY_CACHE_FOLDERS = []
+USE_CACHE           = True
+CACHE_CHECK_MTIME   = True
+
+
+RAW_DATASET_PATHS   = ["/Acquisition/Raw[0]/RawData", "/RawData", "RawData"]
+SAMPLING_RATE_HZ    = None
+GAUGE_LENGTH_M      = None
+DX_M                = None
+RAW_UNIT            = None
+RAW_SCALE           = None
+DATA_TIME_AXIS      = None
+PHASE_WRAPPED       = "auto"
+
+NEFF                = 1.4682
+WAVELENGTH          = 1550.12e-9
+STRAIN_OPTIC_COEFF  = 0.78
+DAS_DIFF_CORRECTION = True
+
+C_HALF_APERTURE_M   = 100.0
+C_FILES_MAX         = 60
+C_WIN_SEC           = 10.0
+C_FMIN              = 0.5
+C_NF                = 300
+C_MIN               = 30.0
+C_MAX               = 3000.0
+C_NC                = 400
+C_Q_THRESH          = 2.0
+C_MIN_WAVELENGTHS   = 1.5
+C_SMOOTHNESS        = 0.004
+C_SPLIT_TOL         = 0.10
+C_MAX_JUMP          = 0.15
+C_MAX_GAP           = 0.25
+TONE_DB             = 2.0
+TONE_WIN_HZ         = 1.5
+F_MIN               = 0.04
+F_MAX               = 200.0
+CELL_SEC            = 20.0
+TIERS               = [(0.03, 0.3, 180.0, 900.0), (0.3, 3.0, 30.0, 180.0), (3.0, 30.0, 3.0, 20.0), (30.0, None, 1.0, 20.0)]
+TIER_BLEND          = 1.5
+N_FREQ_BINS         = 420
+MIN_COVERAGE        = 0.85
+RMS_BAND            = "auto"
+RMS_STEP_SEC        = 5.0
+ENV_DETREND_MIN     = 30.0
+BLOCK_MIN           = 60.0
+SPEC_DISPLAY        = "robust"
+SPEC_ROBUST_CLIM    = (-3.0, 6.0)
+SPEC_CLIM_PCT       = (0.1, 99.99)
+SPEC_COLOR_SCALE    = "asinh"
+SPEC_ASINH_WIDTH    = 3.0
+SPEC_MAD_SMOOTH_BINS = 9
+CMAP_SPEC           = "magma"
+LAG_MAX_SEC         = 300.0
+FIG_SIZE            = (20, 17)
+FONT_MAIN_TITLE     = 17
+FONT_AXIS_LABEL     = 11
+FONT_AXIS_TICKS     = 13
+FONT_ANNOTATION     = 12
+FONT_COLORBAR_LABEL = 14
+FONT_COLORBAR_TICKS = 14
+DPI_SAVE            = 640
+JPEG_QUALITY        = 95
+
+
+PSD_MIN_CYCLES = 3.0
+PSD_MIN_VALID_WINDOWS = 1
+PSD_FALLBACK_FACTORS = (1.0, 0.75, 0.5, 0.33, 0.25, 0.16)
+SPEC_MAD_FLOOR_DB = 1.5
+SEIS_RESPONSE_WATERLEVEL_DB = 80.0
+SEIS_PREFILT_LO_HZ = (0.03, 0.05)
+SEIS_PREFILT_HIGH_FRACTION = (0.85, 0.98)
+
+DAS_STRAIN_RATE_TO_STRAIN_PER_S = 1e-9
+
+
+SAT_DETECT             = True
+SAT_MIN_REPEATS        = 3
+SAT_MIN_SIGMA          = 20.0
+SAT_PILEUP             = 8.0
+SAT_EDGE_QUANTA        = 4.0
+DAS_FULL_SCALE         = None
+SEIS_FULL_SCALE_COUNTS = None
+SPIKE_DETECT           = True
+SPIKE_SIGMA            = 30.0
+SPIKE_MAX_SAMPLES      = 3
+PHASE_SAT_FRACTION     = 0.9
+SAT_REPAIR_MAX_SAMPLES = 5
+SAT_GUARD_SEC          = 0.02
+
+UTC = datetime.timezone.utc
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+class StopRun(Exception):
+    pass
+
+
+def to_posix(dt):
+    return dt.replace(tzinfo=UTC).timestamp()
+
+
+def from_posix(t):
+    return datetime.datetime.fromtimestamp(float(t), tz=UTC).replace(tzinfo=None)
+
+
+_h5_opened = set()
+
+
+def open_h5(path, retries=3):
+    _h5_opened.add(os.path.abspath(path))
+    last = None
+    for k in range(retries):
+        try:
+            try:
+                return h5py.File(path, "r", locking=False)
+            except TypeError:
+                return h5py.File(path, "r")
+        except OSError as e:
+            last = e
+            if "signature" in str(e).lower() or "truncated" in str(e).lower():
+                break
+            time.sleep(0.5 * (k + 1))
+    raise OSError(f"cannot open HDF5 file {os.path.basename(path)} ({last})")
+
+
+_LEN_UNITS = {"m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0, "km": 1e3, "cm": 1e-2,
+              "mm": 1e-3, "ft": 0.3048, "feet": 0.3048, "foot": 0.3048, "us_survey_ft": 0.3048006}
+
+
+META_PATTERNS = {
+    "gauge_length": r"(gauge|gage)[ _-]?len(gth)?([ _-]?(m|meters?|metres?))?",
+    "dx": r"spatial[ _-]?sampling([ _-]?interval)?|(channel|locus|trace)[ _-]?spacing|dx",
+    "output_rate": r"output[ _-]?data[ _-]?rate|(output[ _-]?)?sampling[ _-]?(rate|frequency)|sample[ _-]?rate|fs",
+    "pulse_rate": r"pulse[ _-]?rate|pulse[ _-]?repetition[ _-]?(rate|frequency)|prf",
+    "unit": r"raw[ _-]?data[ _-]?units?|units?",
+    "scale": r"(raw[ _-]?data[ _-]?)?scale([ _-]?factor)?|sensitivity",
+    "start_locus": r"start[ _-]?locus([ _-]?index)?",
+    "start_time": r"part[ _-]?start[ _-]?time|(measurement[ _-]?)?start[ _-]?time",
+    "dimensions": r"dimensions?",
+}
+
+
+def h5_attr_table(h5):
+    rows = [("/", k, v) for k, v in h5.attrs.items()]
+
+    def visit(name, obj):
+        for k, v in obj.attrs.items():
+            rows.append(("/" + name, k, v))
+    h5.visititems(visit)
+    return rows
+
+
+def _text(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="ignore")
+    if isinstance(v, np.ndarray) and v.dtype.kind in "SO" and v.size:
+        return ", ".join(_text(x) or str(x) for x in np.ravel(v))
+    if isinstance(v, np.bytes_):
+        return bytes(v).decode("utf-8", errors="ignore")
+    return v if isinstance(v, str) else None
+
+
+def meta_number(v):
+    t = _text(v)
+    if t is not None:
+        m = re.match(r"\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z\u00b5_/|]*)", t)
+        return (float(m.group(1)), (m.group(2) or None)) if m else (None, None)
+    try:
+        a = np.ravel(np.asarray(v, dtype=float))
+        return (float(a[0]), None) if a.size else (None, None)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def meta_lookup(table, name, prefer=(), numeric=True):
+    """First attribute whose name matches META_PATTERNS[name]; attributes on the
+    objects in `prefer` (e.g. the RawData dataset) win over the rest."""
+    rx = re.compile(META_PATTERNS[name], re.I)
+    hits = [r for r in table if rx.fullmatch(str(r[1]).strip())]
+    hits.sort(key=lambda r: (min([i for i, p in enumerate(prefer) if p.lower() in r[0].lower()], default=99),
+                             len(r[0])))
+    for obj, key, val in hits:
+        num, unit = meta_number(val)
+        txt = _text(val)
+        if numeric and num is None:
+            continue
+        if not numeric and txt is None:
+            continue
+        if unit is None:
+            for o2, k2, v2 in table:
+                if o2 == obj and str(k2).lower() in (f"{key}unit".lower(), f"{key}units".lower(),
+                                                      f"{key}_unit".lower(), f"{key}_units".lower()):
+                    unit = _text(v2) or unit
+        return dict(value=num, unit=unit, text=txt, src=f"{obj}@{key}")
+    return None
+
+
+def meta_length_m(hit, what):
+    if hit is None or hit["value"] is None:
+        return None, None
+    u = (hit["unit"] or "m").strip().lower()
+    f = _LEN_UNITS.get(u)
+    note = hit["src"] + (f" [{hit['unit']}]" if hit["unit"] else "")
+    if f is None:
+        log(f"  ! unknown length unit {hit['unit']!r} for {what} at {hit['src']}, metres assumed")
+        f = 1.0
+    return hit["value"] * f, note
+
+
+def parse_raw_unit(text):
+    """-> (kind, scale): kind phase | phase_rate | strain | strain_rate, scale to rad or strain."""
+    if not text:
+        return None, None
+    t = str(text).lower().replace(" ", "")
+    rate = any(s in t for s in ("/s", "|s", "rate", "pers", "/sec", "s-1", "s^-1"))
+    if "rad" in t:
+        return ("phase_rate" if rate else "phase"), (1e-3 if t.startswith("mrad") else 1.0)
+    if "strain" not in t and "\u03b5" not in t and not t.startswith(("ne", "ue", "\u00b5e")):
+        return None, None
+    scale = 1.0
+    for pre, s in (("nano", 1e-9), ("nstrain", 1e-9), ("n\u03b5", 1e-9), ("ne", 1e-9), ("micro", 1e-6),
+                   ("ustrain", 1e-6), ("\u00b5strain", 1e-6), ("\u00b5\u03b5", 1e-6), ("ue", 1e-6), ("pico", 1e-12),
+                   ("pstrain", 1e-12), ("milli", 1e-3)):
+        if t.startswith(pre) or f"[{pre}" in t or f"({pre}" in t:
+            scale = s
+            break
+    return ("strain_rate" if rate else "strain"), scale
+
+
+def parse_timestamp(filename):
+    """Sintela names carry YYYY-MM-DD_HH.MM.SS_UTC (dashes / dots / colons all accepted)."""
+    m = re.search(r"(\d{4})\W(\d{2})\W(\d{2})[_T\s](\d{2})\W(\d{2})\W(\d{2})(?:[.,](\d{1,6}))?_?UTC", filename)
+    if not m:
+        return None
+    try:
+        g = m.groups()
+        us = int((g[6] or "0").ljust(6, "0")[:6])
+        return datetime.datetime(*[int(x) for x in g[:6]], us)
+    except ValueError:
+        return None
+
+
+def parse_iso_time(txt):
+    if not txt:
+        return None
+    t = str(txt).strip().replace("Z", "+00:00")
+    m = re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:?\d{2})?", t)
+    if not m:
+        return None
+    try:
+        dt = datetime.datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    frac = float(m.group(3)) if m.group(3) else 0.0
+    off = 0.0
+    if m.group(4):
+        z = m.group(4).replace(":", "")
+        off = (1 if z[0] == "+" else -1) * (int(z[1:3]) * 3600 + int(z[3:5]) * 60)
+    return to_posix(dt) + frac - off
+
+
+def epoch_seconds(t):
+    """Sample times in s, us, ns or ms since 1970 -> seconds (by magnitude)."""
+    t = np.asarray(t, dtype=np.float64).ravel()
+    if not t.size or not np.isfinite(t[0]):
+        return None
+    a = abs(t[0])
+    for lim, f in ((1e17, 1e-9), (1e14, 1e-6), (1e11, 1e-3), (1e8, 1.0)):
+        if a >= lim:
+            return t * f
+    return None
+
+
+def find_raw(f):
+    """The RawData dataset (largest 2-D numeric dataset if the usual paths are absent)
+    and its sample-time dataset if there is one."""
+    ds = None
+    for path in RAW_DATASET_PATHS:
+        if path in f and isinstance(f[path], h5py.Dataset) and f[path].ndim == 2:
+            ds = f[path]
+            break
+    if ds is None:
+        best = []
+
+        def visit(name, obj):
+            if isinstance(obj, h5py.Dataset) and obj.ndim == 2 and obj.dtype.kind in "iuf":
+                best.append((obj.size, name))
+        f.visititems(visit)
+        if not best:
+            raise ValueError(f"no 2-D RawData dataset (top level groups {list(f.keys())})")
+        ds = f[max(best)[1]]
+    tds = None
+    parent = ds.parent
+    for k in ("RawDataTime", "Time", "time", "Timestamps", "timestamps"):
+        if k in parent and isinstance(parent[k], h5py.Dataset):
+            tds = parent[k]
+            break
+    return ds, tds
+
+
+def file_layout(f):
+    ds, tds = find_raw(f)
+    table = h5_attr_table(f)
+    pref = (ds.name, ds.parent.name, "/Acquisition")
+
+    dims = meta_lookup([r for r in table if r[0] == ds.name], "dimensions", numeric=False)
+    dtxt = (dims or {}).get("text") or ""
+    time_axis = 0
+    if dtxt:
+        parts = [p.strip().lower() for p in re.split(r"[,;\s]+", dtxt) if p.strip()]
+        if parts and parts[0].startswith(("locus", "loci", "channel", "distance", "space")):
+            time_axis = 1
+    elif tds is not None and tds.size == ds.shape[1] and tds.size != ds.shape[0]:
+        time_axis = 1
+    if DATA_TIME_AXIS is not None:
+        time_axis = int(DATA_TIME_AXIS)
+    n_t, n_ch = (ds.shape[0], ds.shape[1]) if time_axis == 0 else (ds.shape[1], ds.shape[0])
+
+    fs, fs_src = None, None
+    t_s = None
+    if tds is not None and tds.size == n_t and n_t > 2:
+        k = min(n_t, 200001)
+        t_s = epoch_seconds(tds[:k])
+        if t_s is not None:
+            d = np.diff(t_s)
+            d = d[d > 0]
+            if d.size:
+                fs, fs_src = 1.0 / float(np.median(d)), f"{tds.name} (median sample interval)"
+    hit = meta_lookup(table, "output_rate", prefer=pref)
+    nominal = hit["value"] if hit and hit["value"] and hit["value"] > 0 else None
+    if fs is None and nominal:
+        fs, fs_src = nominal, hit["src"]
+    elif fs is not None and nominal and abs(fs / nominal - 1.0) < 2e-3:
+        fs = nominal
+        fs_src += f", = {hit['src']}"
+    pulse = meta_lookup(table, "pulse_rate", prefer=pref)
+    pulse_rate = pulse["value"] if pulse and pulse["value"] and pulse["value"] > 0 else None
+    if fs is None and pulse_rate:
+        fs, fs_src = pulse_rate, pulse["src"] + " (PulseRate: correct only if the data are not decimated)"
+    if SAMPLING_RATE_HZ:
+        fs, fs_src = float(SAMPLING_RATE_HZ), "setting SAMPLING_RATE_HZ (override)"
+    if not fs:
+        raise ValueError("no sampling rate in the file: set SAMPLING_RATE_HZ")
+    fs = float(f"{fs:.9g}")
+
+    g, g_src = meta_length_m(meta_lookup(table, "gauge_length", prefer=pref), "gauge length")
+    if GAUGE_LENGTH_M:
+        g, g_src = float(GAUGE_LENGTH_M), "setting GAUGE_LENGTH_M (override)"
+    dx, dx_src = meta_length_m(meta_lookup(table, "dx", prefer=pref), "channel spacing")
+    if DX_M:
+        dx, dx_src = float(DX_M), "setting DX_M (override)"
+    if not dx and g:
+        dx, dx_src = float(g), "no SpatialSamplingInterval: gauge length used (as in the other Sintela scripts); set DX_M"
+    if not dx:
+        raise ValueError("no channel spacing in the file: set DX_M")
+
+    u = meta_lookup(table, "unit", prefer=pref, numeric=False)
+    kind, uscale = parse_raw_unit(u["text"]) if u else (None, None)
+    u_src = u["src"] + f" = {u['text']!r}" if u else None
+    if RAW_UNIT:
+        kind, uscale = parse_raw_unit(RAW_UNIT)
+        u_src = f"setting RAW_UNIT = {RAW_UNIT!r}"
+    if kind is None:
+        kind, uscale, u_src = "phase", 1.0, "no unit attribute: optical phase in rad assumed (as in the other Sintela scripts)"
+    sc = meta_lookup([r for r in table if r[0] in (ds.name, ds.parent.name)], "scale", prefer=pref)
+    raw_scale, raw_scale_src = (sc["value"], sc["src"]) if sc and sc["value"] else (1.0, "none (1.0)")
+    if RAW_SCALE is not None:
+        raw_scale, raw_scale_src = float(RAW_SCALE), "setting RAW_SCALE (override)"
+    if kind in ("phase", "phase_rate") and not g:
+        raise ValueError("phase data need the gauge length for the strain conversion: set GAUGE_LENGTH_M")
+    sl = meta_lookup(table, "start_locus", prefer=pref)
+    st_hit = meta_lookup(table, "start_time", prefer=pref, numeric=False)
+    x0 = 0.0
+    return ds, tds, t_s, {
+        "n_t": int(n_t), "n_ch": int(n_ch), "time_axis": int(time_axis), "dataset": ds.name,
+        "time_dataset": tds.name if tds is not None else None,
+        "fs": fs, "fs_src": fs_src, "pulse_rate": pulse_rate,
+        "dx": float(dx), "dx_src": dx_src, "gauge_m": g, "gauge_src": g_src,
+        "unit_kind": kind, "unit_scale": float(uscale), "unit_src": u_src,
+        "raw_scale": float(raw_scale), "raw_scale_src": raw_scale_src,
+        "x0": x0, "x0_src": "channel 0 at 0 m (optical position = channel x dx, as in the other Sintela scripts)",
+        "start_locus": None if sl is None else sl["value"],
+        "start_time_attr": None if st_hit is None else parse_iso_time(st_hit["text"])}
+
+
+def phase_factor(L):
+    """rad -> strain:  eps = lambda * phi / (4 pi n_eff xi GL)."""
+    return WAVELENGTH / (4.0 * np.pi * NEFF * STRAIN_OPTIC_COEFF * float(L["gauge_m"]))
+
+
+def to_strain_rate(raw, L, wrapped):
+    """(time, channel) raw samples -> strain rate in n-strain/s, plus the phase
+    rate in rad/s (None for strain data) for the phase-saturation test.
+
+    The derivative is a first difference; the first sample of a file uses the
+    forward difference, so files join without a missing sample (a phase offset
+    between files never enters the derivative)."""
+    fs, k = L["fs"], L["unit_kind"]
+    x = raw.astype(np.float64) * L["raw_scale"] * L["unit_scale"]
+    if k in ("phase", "strain"):
+        d = np.diff(x, axis=0)
+        if k == "phase" and wrapped:
+            d = (d + np.pi) % (2.0 * np.pi) - np.pi
+        d = np.concatenate([d[:1], d], axis=0) * fs
+    else:
+        d = x
+    if k in ("phase", "phase_rate"):
+        return d * phase_factor(L) * 1e9, d
+    return d * 1e9, None
+
+
+def read_file(path, channels):
+    ch = np.asarray(channels, dtype=int)
+    with open_h5(path) as f:
+        ds, tds, t_s, L = file_layout(f)
+        if ch.size == 0 or ch.min() < 0 or ch.max() >= L["n_ch"]:
+            raise ValueError(f"channels outside 0..{L['n_ch'] - 1} in {os.path.basename(path)}")
+        c0, c1 = int(ch.min()), int(ch.max()) + 1
+        if L["time_axis"] == 0:
+            raw = ds[:, c0:c1][:, ch - c0] if c1 - c0 <= 4 * len(ch) else np.stack([ds[:, int(c)] for c in ch], axis=1)
+        else:
+            raw = (ds[c0:c1, :][ch - c0, :] if c1 - c0 <= 4 * len(ch) else np.stack([ds[int(c), :] for c in ch])).T
+        if tds is not None and tds.size == L["n_t"] and (t_s is None or len(t_s) < L["n_t"]):
+            t_s = epoch_seconds(tds[:])
+    fs = L["fs"]
+    wrapped = False
+    if L["unit_kind"] == "phase":
+        if PHASE_WRAPPED == "auto":
+            a = np.nanmax(np.abs(raw)) * L["raw_scale"] * L["unit_scale"]
+            wrapped = bool(a <= np.pi * 1.0001 and np.nanmax(np.abs(np.diff(raw[:, :min(raw.shape[1], 8)], axis=0)))
+                           * L["raw_scale"] * L["unit_scale"] > np.pi)
+        else:
+            wrapped = bool(PHASE_WRAPPED)
+    L["wrapped"] = wrapped
+    x, prate = to_strain_rate(raw, L, wrapped)
+
+    L["time_note"] = ""
+    ts = parse_timestamp(os.path.basename(path))
+    t_name = to_posix(ts) if ts is not None else None
+    dur = L["n_t"] / fs
+    t0 = None
+    if t_s is not None and len(t_s) == L["n_t"] and np.all(np.isfinite(t_s)):
+        if t_name is None or abs(t_s[0] - t_name) <= max(120.0, 2.0 * dur):
+            t0 = float(t_s[0])
+            idx = np.round((t_s - t_s[0]) * fs).astype(np.int64)
+            dif = np.diff(idx)
+            if np.all(dif >= 1) and np.any(dif != 1) and idx[-1] < 4 * L["n_t"]:
+                full = np.full((int(idx[-1]) + 1, x.shape[1]), np.nan)
+                full[idx] = x
+                for j in np.flatnonzero(dif > 1):
+                    full[idx[j + 1]] = np.nan
+                x = full
+                if prate is not None:
+                    pf = np.full((int(idx[-1]) + 1, prate.shape[1]), np.nan)
+                    pf[idx] = prate
+                    prate = pf
+                L["time_note"] = f"{int(np.sum(dif - 1))} missing samples inside the file (from {L['time_dataset']})"
+            elif np.any(dif < 1):
+                L["time_note"] = "sample times not increasing: samples placed end to end from the first time"
+        else:
+            L["time_note"] = "sample times far from the file-name time: file-name time used"
+    if t0 is None and L.get("start_time_attr") is not None and (t_name is None or abs(L["start_time_attr"] - t_name) <= max(120.0, 2.0 * dur)):
+        t0 = float(L["start_time_attr"])
+        L["time_note"] = L["time_note"] or "start time from the file attributes"
+    if t0 is None:
+        if t_name is None:
+            raise ValueError(f"no usable sample times and no time stamp in {os.path.basename(path)}")
+        t0 = t_name
+        L["time_note"] = L["time_note"] or "no sample times: file-name time used"
+
+    L["sat_masked"], L["sat_bridged"] = [], []
+    lim = PHASE_SAT_FRACTION * np.pi * float(L.get("pulse_rate") or fs)
+    g = int(round(SAT_GUARD_SEC * fs))
+    for j in range(x.shape[1]):
+        yj = x[:, j].copy()
+        ph = np.zeros(len(yj), dtype=bool)
+        if prate is not None and SAT_DETECT:
+            with np.errstate(invalid="ignore"):
+                ph = _grow(np.isfinite(prate[:, j]) & (np.abs(prate[:, j]) >= lim), g)
+            ph &= np.isfinite(yj)
+            yj[ph] = np.nan
+        yj, im, ib = fix_saturation(yj, fs, "das")
+        im = np.union1d(im, np.flatnonzero(ph)).astype(np.int64)
+        x[:, j] = yj
+        L["sat_masked"].append(im)
+        L["sat_bridged"].append(np.setdiff1d(ib, im).astype(np.int64))
+    return x.astype(np.float32), t0, L
+
+
+def file_info(path):
+    with open_h5(path) as f:
+        _, _, _, L = file_layout(f)
+    return L
+
+
+def inspect_file(path):
+    print(f"structure of {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+    with open_h5(path) as f:
+        def show(name, obj):
+            kind = f"dataset {name}  shape {obj.shape}  dtype {obj.dtype}" if isinstance(obj, h5py.Dataset)\
+                else f"group   {name}"
+            print("  " + kind)
+            for k, v in obj.attrs.items():
+                print(f"            attr {k} = {str(v).replace(chr(10), ' ')[:80]}")
+        f.visititems(show)
+
+
+def list_files(folder, recursive):
+
+
+    if not os.path.isdir(folder):
+        raise StopRun(f"DATA_FOLDER does not exist (is the disk mounted?): {folder}")
+    pat = os.path.join(folder, "**", FILE_PATTERN) if recursive else os.path.join(folder, FILE_PATTERN)
+    files = [p for p in sorted(glob.glob(pat, recursive=recursive))
+             if p.lower().endswith(".h5") and not os.path.basename(p).startswith(".")
+             and os.path.getsize(p) >= 10000]
+    if not files:
+        n_all = len(glob.glob(os.path.join(folder, "*")))
+        raise StopRun(f"no h5 files matching {FILE_PATTERN!r} in {folder} ({n_all} entries in the folder)")
+    stamped = sorted([(p, parse_timestamp(os.path.basename(p))) for p in files
+                      if parse_timestamp(os.path.basename(p)) is not None], key=lambda r: r[1])
+    if not stamped:
+        raise StopRun(f"no file name has a UTC time stamp like YYYY-MM-DD_HH.MM.SS_UTC, e.g. "
+                      f"{os.path.basename(files[0])}")
+    gaps = np.diff([to_posix(ts) for _, ts in stamped])
+    gaps = gaps[gaps > 0]
+    file_sec = float(np.median(gaps)) if gaps.size else 60.0
+    log(f"{len(stamped)} files in {folder}, {stamped[0][1]:%Y-%m-%d %H:%M:%S} to "
+        f"{stamped[-1][1] + datetime.timedelta(seconds=file_sec):%Y-%m-%d %H:%M:%S} UTC, {file_sec:.0f} s each")
+    return stamped, file_sec
+
+
+def files_between(stamped, file_sec, a, b, margin=5.0):
+    return [p for p, ts in stamped if to_posix(ts) - margin < b and to_posix(ts) + file_sec + margin > a]
+
+
+def check_window(stamped, file_sec, ta, tb):
+
+    first = to_posix(stamped[0][1])
+    last = to_posix(stamped[-1][1]) + file_sec
+    span = f"{from_posix(first):%Y-%m-%d %H:%M:%S} to {from_posix(last):%Y-%m-%d %H:%M:%S} UTC"
+    if tb <= first or ta >= last:
+        raise StopRun(f"the window {from_posix(ta):%Y-%m-%d %H:%M} - {from_posix(tb):%H:%M} UTC is outside the "
+                      f"recording ({span}); change WINDOWS")
+    if ta < first or tb > last:
+        log(f"  ! the window is only partly inside the recording ({span}), the rest stays empty")
+
+
+def contiguous_runs(mask):
+    if not np.any(mask):
+        return []
+    d = np.diff(np.concatenate([[0], np.asarray(mask).astype(np.int8), [0]]))
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+
+def parse_window_time(txt):
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(str(txt).strip().replace("T", " "), fmt)
+        except ValueError:
+            continue
+    raise StopRun(f"cannot read the time '{txt}', use YYYY-MM-DD HH:MM")
+
+
+def next_path(base, ext):
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    rx = re.compile(re.escape(base) + r"_(\d{4,})\.[A-Za-z0-9]+$")
+    used = [int(m.group(1)) for m in map(rx.match, os.listdir(OUTPUT_FOLDER)) if m]
+    return os.path.join(OUTPUT_FOLDER, f"{base}_{max(used, default=0) + 1:04d}.{ext}")
+
+
+CACHE_VERSION = 5
+
+
+def sat_settings_tag():
+    """Short hash of the saturation settings; part of every cache name / key."""
+    txt = json.dumps([SAT_DETECT, SAT_MIN_REPEATS, SAT_MIN_SIGMA, SAT_PILEUP, SAT_EDGE_QUANTA, DAS_FULL_SCALE, SEIS_FULL_SCALE_COUNTS,
+                      SPIKE_DETECT, SPIKE_SIGMA, SPIKE_MAX_SAMPLES, PHASE_SAT_FRACTION, PHASE_WRAPPED, SAT_REPAIR_MAX_SAMPLES, SAT_GUARD_SEC], default=str)
+    return hashlib.md5(txt.encode()).hexdigest()[:6]
+
+
+_step_override = None
+
+
+_cache_stats = {"hit": 0, "built": 0, "rebuilt": 0, "off": 0}
+
+
+_rebuild = False
+
+
+def reader_tag():
+    """Hash of the reader settings: changing any of them invalidates layouts and caches."""
+    txt = json.dumps([RAW_DATASET_PATHS, SAMPLING_RATE_HZ, GAUGE_LENGTH_M, DX_M, RAW_UNIT, RAW_SCALE, DATA_TIME_AXIS,
+                      PHASE_WRAPPED, NEFF, WAVELENGTH, STRAIN_OPTIC_COEFF], default=str)
+    return hashlib.md5(txt.encode()).hexdigest()[:6]
+
+
+def cache_tag():
+    return f"_r{reader_tag()}_q{sat_settings_tag()}"
+
+
+def cache_path(path, ch):
+    base = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(CACHE_FOLDER, f"{base}_{CABLE}_ch{ch}{cache_tag()}.npz")
+
+
+def cache_folders():
+    out = [CACHE_FOLDER] + [f for f in (LEGACY_CACHE_FOLDERS or []) if f]
+    return [f for i, f in enumerate(out) if f and f not in out[:i]]
+
+
+def cache_valid(h, st):
+
+
+    if 'version' not in h.files or int(h['version']) != CACHE_VERSION:
+        return False
+    if int(h['src_size']) != st.st_size:
+        return False
+    if CACHE_CHECK_MTIME and abs(float(h['src_mtime']) - st.st_mtime) > 2.5:
+        return False
+    return True
+
+
+def find_cache(name, st):
+    if not USE_CACHE or _rebuild:
+        return None
+    for folder in cache_folders():
+        cp = os.path.join(folder, name)
+        if not os.path.exists(cp):
+            continue
+        try:
+            h = np.load(cp, allow_pickle=False)
+            if cache_valid(h, st):
+                return h
+            h.close()
+        except Exception:
+            continue
+    return None
+
+
+def write_channel_cache(path, ch, y, t0, L, st, sat=((), ())):
+    cp = cache_path(path, ch)
+    try:
+        os.makedirs(CACHE_FOLDER, exist_ok=True)
+        with open(cp + ".tmp", "wb") as fh:
+            np.savez(fh, x=y.astype(np.float32), t0=np.float64(t0), fs=np.float64(L["fs"]),
+                     src_size=np.int64(st.st_size), src_mtime=np.float64(st.st_mtime),
+                     version=np.int64(CACHE_VERSION), channel=np.int64(ch), time_note=str(L.get("time_note", "")),
+                     sat_masked=np.asarray(sat[0], dtype=np.int64), sat_bridged=np.asarray(sat[1], dtype=np.int64))
+        os.replace(cp + ".tmp", cp)
+        _cache_stats["built"] += 1
+    except OSError as e:
+        log(f"  ! cannot write the cache in {CACHE_FOLDER} ({e}), continuing without it")
+
+
+def read_channels_cached(path, chans):
+    st = os.stat(path)
+    out, t0, info, missing, sat = {}, None, {}, [], {}
+    for ch in chans:
+        h = find_cache(os.path.basename(cache_path(path, ch)), st)
+        if h is None:
+            missing.append(ch)
+            continue
+        with h:
+            _cache_stats["hit"] += 1
+            out[ch] = h["x"].astype(np.float32)
+            t0 = float(h["t0"])
+            info = {"fs": float(h["fs"]), "time_note": str(h["time_note"]) if "time_note" in h.files else ""}
+            sat[ch] = (h["sat_masked"] if "sat_masked" in h.files else np.zeros(0, np.int64),
+                       h["sat_bridged"] if "sat_bridged" in h.files else np.zeros(0, np.int64))
+    if missing:
+        y, t0m, L = read_file(path, missing)
+        for j, ch in enumerate(missing):
+            out[ch] = y[:, j].astype(np.float32)
+            sat[ch] = (L["sat_masked"][j], L["sat_bridged"][j])
+            if USE_CACHE:
+                write_channel_cache(path, ch, y[:, j], t0m, L, st, sat[ch])
+            else:
+                _cache_stats["off"] += 1
+        if t0 is not None and abs(t0 - t0m) > 1e-6:
+            raise ValueError("cached and new channels of this file are not aligned: run with --rebuild")
+        t0 = t0m
+        info = {"fs": L["fs"], "time_note": L.get("time_note", "")}
+    n = min(len(v) for v in out.values())
+    info["sat"] = {ch: (sat[ch][0][sat[ch][0] < n], sat[ch][1][sat[ch][1] < n]) for ch in chans}
+    return np.stack([out[ch][:n] for ch in chans], axis=1), t0, info
+
+
+_layouts = {}
+
+
+_db = {"layout": None, "meta": None, "dirty": set()}
+
+
+def db_path(kind):
+    return os.path.join(CACHE_FOLDER, f"{kind}_{CABLE}.json")
+
+
+def db_load(kind):
+    import json
+    if _db[kind] is None:
+        _db[kind] = {}
+        if USE_CACHE and not _rebuild:
+            for folder in reversed(cache_folders()):
+                fp = os.path.join(folder, f"{kind}_{CABLE}.json")
+                if os.path.exists(fp):
+                    try:
+                        with open(fp, encoding="utf-8") as fh:
+                            _db[kind].update(json.load(fh))
+                    except Exception:
+                        pass
+    return _db[kind]
+
+
+def db_save():
+    import json
+    if not USE_CACHE:
+        return
+    for kind in list(_db["dirty"]):
+        try:
+            os.makedirs(CACHE_FOLDER, exist_ok=True)
+            fp = db_path(kind)
+            with open(fp + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(_db[kind], fh)
+            os.replace(fp + ".tmp", fp)
+        except OSError as e:
+            log(f"  ! cannot write {db_path(kind)} ({e})")
+    _db["dirty"].clear()
+
+
+def x0_of(L):
+    return float(DISTANCE_OFFSET_M) if DISTANCE_OFFSET_M is not None else float(L.get("x0", 0.0) or 0.0)
+
+
+def layout_of(path):
+    if path in _layouts:
+        return _layouts[path]
+    db = db_load("layout")
+    n, size = os.path.basename(path), os.path.getsize(path)
+    e = db.get(n)
+    if e is not None and e.get("src_size") == size and "x0" in e and e.get("reader") == reader_tag() and e.get("cache_version") == CACHE_VERSION:
+        L = dict(e)
+    else:
+        L = file_info(path)
+        L = {k: v for k, v in L.items() if isinstance(v, (int, float, str, bool)) or v is None}
+        L["src_size"] = size
+        L["reader"] = reader_tag()
+        L["cache_version"] = CACHE_VERSION
+        db[n] = L
+        _db["dirty"].add("layout")
+    _layouts[path] = L
+    return L
+
+
+def convert_seismic():
+    from obspy import read
+    src = sorted(glob.glob(os.path.join(SEIS_FOLDER, SEIS_PATTERN)))
+    if not src:
+        raise StopRun(f"no seismic files matching {SEIS_PATTERN!r} in {SEIS_FOLDER}")
+    os.makedirs(SEIS_CONVERTED_FOLDER, exist_ok=True)
+    out, rows = [], []
+    for p in src:
+        name = os.path.basename(p)
+        stem = name[:-3] if name.lower().endswith(".gz") else name
+        stem = re.sub(r"\.(mseed|miniseed|msd|sac|seed)$", "", stem, flags=re.I)
+        dst = os.path.join(SEIS_CONVERTED_FOLDER, stem + ".mseed")
+        if os.path.exists(dst) and os.path.getsize(dst) > 0 and os.path.getmtime(dst) >= os.path.getmtime(p) and not _rebuild:
+            out.append(dst)
+            rows.append((name, "already converted", os.path.basename(dst)))
+            continue
+        try:
+            raw = gzip.open(p, "rb").read() if name.lower().endswith(".gz") else open(p, "rb").read()
+            st = read(io.BytesIO(raw))
+            fmt = st[0].stats._format if len(st) else "?"
+            if fmt == "MSEED":
+                with open(dst + ".tmp", "wb") as fh:
+                    fh.write(raw)
+            else:
+                for tr in st:
+                    if tr.data.dtype.kind == "f" and tr.data.dtype.itemsize == 8:
+                        tr.data = tr.data.astype(np.float64)
+                st.write(dst + ".tmp", format="MSEED")
+            os.replace(dst + ".tmp", dst)
+            out.append(dst)
+            rows.append((name, f"{fmt} -> MSEED, {len(st)} traces", os.path.basename(dst)))
+        except Exception as e:
+            rows.append((name, f"NOT CONVERTED: {e}", "-"))
+            log(f"  ! {name} could not be converted: {e}")
+    log(f"  seismic files: {len(out)} of {len(src)} ready in {SEIS_CONVERTED_FOLDER}")
+    return out, rows
+
+
+def response_files():
+    if not RESPONSE_FILE:
+        return []
+    items = RESPONSE_FILE if isinstance(RESPONSE_FILE, (list, tuple)) else [RESPONSE_FILE]
+    out = []
+    for it in items:
+        hits = sorted(glob.glob(str(it))) if any(c in str(it) for c in "*?[") else ([str(it)] if os.path.isfile(str(it)) else [])
+        out += [h for h in hits if h not in out]
+    return out
+
+
+def load_inventory():
+    files = response_files()
+    if not files:
+        return None
+    from obspy import read_inventory
+    inv = None
+    for fpath in files:
+        try:
+            part = read_inventory(fpath)
+        except Exception as e:
+            log(f"  ! response file {os.path.basename(fpath)} not readable: {e}")
+            continue
+        inv = part if inv is None else inv + part
+        log(f"  response file {os.path.basename(fpath)}: " + ", ".join(
+            f"{n.code}.{s_.code}.{c.location_code}.{c.code}" for n in part for s_ in n for c in s_))
+    if inv is None:
+        raise StopRun("none of the response files could be read")
+    return inv
+
+
+_resp_cache = {}
+
+
+def response_lookup(inv, tr):
+    from obspy import UTCDateTime
+    key = tr.id
+    if key in _resp_cache:
+        return _resp_cache[key]
+    try:
+        r = inv.get_response(tr.id, UTCDateTime(tr.stats.starttime))
+        _resp_cache[key] = (r, f"{tr.id} (exact)")
+        return _resp_cache[key]
+    except Exception:
+        pass
+    if RESPONSE_MATCH == "exact":
+        _resp_cache[key] = None
+        return None
+    cha = tr.stats.channel
+    fam, comp = cha[:2].upper(), cha[-1:].upper()
+    alias = {"1": "1N", "N": "N1", "2": "2E", "E": "E2", "Z": "Z3", "3": "3Z"}
+    cands = []
+    for n in inv:
+        for s_ in n:
+            for c in s_:
+                if c.response is None:
+                    continue
+                if c.code == cha:
+                    score = 8
+                elif c.code[:2].upper() == fam and c.code[-1:].upper() in alias.get(comp, comp):
+                    score = 4
+                else:
+                    continue
+                score += 2 if s_.code == tr.stats.station else 0
+                score += 1 if n.code == tr.stats.network else 0
+                cands.append((score, f"{n.code}.{s_.code}.{c.location_code}.{c.code}", c.response))
+    if not cands:
+        _resp_cache[key] = None
+        return None
+    cands.sort(key=lambda r: -r[0])
+    _resp_cache[key] = (cands[0][2], f"{cands[0][1]} (matched by {'channel code' if cands[0][0] >= 8 else 'component'})")
+    log(f"  response for {tr.id}: {_resp_cache[key][1]}")
+    return _resp_cache[key]
+
+
+def response_for(inv, tr):
+    r = response_lookup(inv, tr)
+    if r is None:
+        raise StopRun(f"no response for {tr.id} in the response file(s); run --list-seismic to compare the codes")
+    return r
+
+
+_excluded = {}
+
+
+def waveform_ok(tr):
+    if tr.stats.sampling_rate is None or not np.isfinite(tr.stats.sampling_rate) or tr.stats.sampling_rate <= 0:
+        return f"sampling rate {tr.stats.sampling_rate} (log / state-of-health record)"
+    if tr.stats.npts == 0:
+        return "no samples"
+    if getattr(tr.data, "dtype", None) is None or tr.data.dtype.kind not in "iuf":
+        return f"non-numeric samples ({getattr(tr.data, 'dtype', '?')})"
+    return None
+
+
+def traces_window(trs, t0, t1):
+    fs = trs[0].stats.sampling_rate
+    n = int(round((t1 - t0) * fs))
+    y = np.full(n, np.nan)
+    for tr in trs:
+        if tr.stats.endtime.timestamp < t0 or tr.stats.starttime.timestamp > t1:
+            continue
+        data = tr.data
+        data = np.ma.filled(data.astype(np.float64), np.nan) if np.ma.isMaskedArray(data) else data.astype(np.float64)
+        i0 = int(round((tr.stats.starttime.timestamp - t0) * fs))
+        s0, s1 = max(0, i0), min(n, i0 + len(data))
+        if s1 > s0:
+            seg = data[s0 - i0:s1 - i0]
+            ok = ~np.isnan(seg)
+            y[s0:s1][ok] = seg[ok]
+    return y, fs
+
+
+def das_window(stamped, file_sec, t0, t1, dist, fs):
+    y = np.full(int(round((t1 - t0) * fs)), np.nan)
+    flag = np.zeros(len(y), dtype=np.int8)
+    ch_used = None
+    for p in files_between(stamped, file_sec, t0, t1):
+        try:
+            L = layout_of(p)
+            ch = int(round((dist - x0_of(L)) / L["dx"]))
+            if not 0 <= ch < L["n_ch"] or abs(L["fs"] / fs - 1.0) > 1e-4:
+                continue
+            Y, tf, info = read_channels_cached(p, [ch])
+            ch_used = ch
+        except Exception as e:
+            log(f"  ! {os.path.basename(p)}: {e}")
+            continue
+        x = Y[:, 0].astype(np.float64)
+        i0 = int(round((tf - t0) * fs))
+        s0, s1 = max(0, i0), min(len(y), i0 + len(x))
+        if s1 > s0:
+            seg = x[s0 - i0:s1 - i0]
+            ok = ~np.isnan(seg)
+            y[s0:s1][ok] = seg[ok]
+            for code, idx in ((1, info["sat"][ch][1]), (2, info["sat"][ch][0])):
+                k = idx + i0
+                k = k[(k >= s0) & (k < s1)]
+                flag[k] = code
+    return y, ch_used, flag
+
+
+def _robust_centre_sigma(v):
+    v = v[np.isfinite(v)]
+    if v.size < 16:
+        return np.nan, np.nan
+    med = float(np.median(v))
+    return med, 1.4826 * float(np.median(np.abs(v - med)))
+
+
+def _noise_sigma(v, n_chunks=64):
+    """Robust sigma of the quiet part of a trace: the 20th percentile of the MAD
+    sigmas of short chunks, so a strong event filling much of the record does not
+    inflate the noise estimate."""
+    v = v[np.isfinite(v)]
+    if v.size < 64:
+        return np.nan
+    k = max(32, v.size // n_chunks)
+    m = v.size // k
+    C = v[:m * k].reshape(m, k)
+    s_ = 1.4826 * np.median(np.abs(C - np.median(C, axis=1, keepdims=True)), axis=1)
+    s_ = s_[s_ > 0]
+    return float(np.percentile(s_, 20)) if s_.size else np.nan
+
+
+def _grow(flag, n):
+    """Widen every True run of a boolean array by n samples on both sides."""
+    if n <= 0 or not flag.any():
+        return flag
+    out = flag.copy()
+    for a, b in contiguous_runs(flag):
+        out[max(0, a - n):b + n] = True
+    return out
+
+
+def clipped_samples(y, full_scale=None):
+    """Flat-top clipping.
+
+    A recorder at full scale writes the same extreme value again and again; a
+    real waveform passes its largest peak once. Candidates are the samples that
+    carry the record's maximum (or minimum) value when that value lies
+    SAT_MIN_SIGMA noise sigmas from the median and occurs >= SAT_MIN_REPEATS
+    times. A candidate run is accepted only if the trace runs into or out of it
+    with a step of >= SAT_EDGE_QUANTA quantisation steps: a rail cuts a waveform
+    off while it is still moving, whereas the crest of a large long-period wave
+    in integer counts can repeat a value but is entered with a step of about one
+    count. The extreme must also "pile up": occur SAT_PILEUP times more often
+    than the values just inside it, which separates a rail from the crests of a
+    steady tone. Float DAS data have a tiny quantisation step, so for them any
+    exact repetition of the extreme far from the median counts."""
+    n = len(y)
+    flag = np.zeros(n, dtype=bool)
+    ok = np.isfinite(y)
+    if ok.sum() < 64:
+        return flag
+    v = y[ok]
+    med, _ = _robust_centre_sigma(v)
+    sig = _noise_sigma(v)
+    if not np.isfinite(sig):
+        return flag
+    d = np.abs(np.diff(v))
+    d = d[d > 0]
+    q = float(np.percentile(d, 1.0)) if d.size else 0.0
+
+
+    q0 = float(d.min()) if d.size else 0.0
+    sub = v[:: max(1, v.size // 20000)]
+    quantised = q0 > 0 and np.mean(np.abs(sub / q0 - np.round(sub / q0)) < 1e-3) > 0.9
+    thr = (SAT_MIN_SIGMA if quantised else 3.0) * max(sig, 1e-30)
+    cand = np.zeros(n, dtype=bool)
+    with np.errstate(invalid="ignore"):
+        for ext in (float(v.max()), float(v.min())):
+            if abs(ext - med) < thr:
+                continue
+            tol = abs(ext) * 1e-12
+            hit = ok & (np.abs(y - ext) <= tol)
+            n_hit = int(hit.sum())
+            if n_hit < SAT_MIN_REPEATS:
+                continue
+
+
+            span = 10.0 * q
+            inside = ok & ~hit & (np.abs(y - ext) < span)
+            density = inside.sum() / 10.0
+            if n_hit >= SAT_PILEUP * density:
+                cand |= hit
+    if cand.any():
+        edge_thr = SAT_EDGE_QUANTA * q
+        for a, b in contiguous_runs(cand):
+            steps = [abs(y[a] - y[a - 1]) if a > 0 else 0.0, abs(y[b] - y[b - 1]) if b < n else 0.0]
+            steps = [x for x in steps if np.isfinite(x)]
+            if steps and max(steps) >= edge_thr:
+                flag[a:b] = True
+    if full_scale:
+        with np.errstate(invalid="ignore"):
+            flag |= ok & (np.abs(y) >= 0.999 * float(full_scale))
+    return flag
+
+
+def spike_samples(y):
+    """Isolated spikes (phase-unwrapping errors).
+
+    Hampel-type test: the deviation from a (2*SPIKE_MAX_SAMPLES+1)-sample running
+    median must exceed SPIKE_SIGMA times the LOCAL spread of the trace (running
+    median of |sample-to-sample change| over 21 samples, which a spike of 1-3
+    samples cannot raise) and the quiet-noise level. A strong but smooth or
+    oscillating real signal raises its own local spread and is never flagged;
+    only runs of <= SPIKE_MAX_SAMPLES samples that come back to the level the
+    trace had before them qualify."""
+    from scipy.ndimage import median_filter
+    flag = np.zeros(len(y), dtype=bool)
+    width = 2 * int(SPIKE_MAX_SAMPLES) + 1
+    wide = max(21, 3 * width)
+    for a, b in contiguous_runs(np.isfinite(y)):
+        if b - a < 4 * wide:
+            continue
+        seg = np.asarray(y[a:b], dtype=np.float64)
+        r = seg - median_filter(seg, size=width, mode="nearest")
+        dd = np.abs(np.diff(seg, prepend=seg[0]))
+        loc = 1.05 * median_filter(dd, size=wide, mode="nearest")
+        floor = _noise_sigma(r)
+        floor = floor if np.isfinite(floor) else 0.0
+        scale = np.maximum(loc, floor)
+        if not np.any(scale > 0):
+            continue
+        hit = (scale > 0) & (np.abs(r) > SPIKE_SIGMA * scale)
+        if not hit.any():
+            continue
+        for p, q in contiguous_runs(hit):
+            if q - p > SPIKE_MAX_SAMPLES or p == 0 or q >= len(seg):
+                continue
+
+
+            base = 0.5 * (seg[p - 1] + seg[q])
+            amp = np.max(np.abs(seg[p:q] - base))
+            if abs(seg[q] - seg[p - 1]) <= 0.25 * amp:
+                flag[a + p:a + q] = True
+    return flag
+
+
+def fix_saturation(y, fs, kind):
+    """Repair recording saturation in one trace (kind 'das' or 'seis').
+
+    Returns (y_fixed, idx_masked, idx_bridged): clipped runs (+ guard) become NaN,
+    short spikes are bridged with a short cubic between their finite neighbours, longer
+    spike runs become NaN. Nothing else is changed."""
+    y = np.array(y, dtype=np.float64, copy=True)
+    fin = np.isfinite(y)
+    empty = np.zeros(0, dtype=np.int64)
+    if not SAT_DETECT and not (SPIKE_DETECT and kind == "das"):
+        return y, empty, empty
+    n = len(y)
+
+
+    spike = spike_samples(y) if (SPIKE_DETECT and kind == "das") else np.zeros(n, dtype=bool)
+    clip = clipped_samples(np.where(spike, np.nan, y), DAS_FULL_SCALE if kind == "das" else SEIS_FULL_SCALE_COUNTS) \
+        if SAT_DETECT else np.zeros(n, dtype=bool)
+    clip = _grow(clip, int(round(SAT_GUARD_SEC * fs)))
+    spike &= ~clip
+    masked = clip.copy()
+    bridged = np.zeros(n, dtype=bool)
+    for a, b in contiguous_runs(spike):
+
+
+        nb = 4
+        lo, hi = np.arange(max(0, a - nb), a), np.arange(b, min(n, b + nb))
+        lo = lo[np.isfinite(y[lo]) & ~masked[lo] & ~spike[lo]]
+        hi = hi[np.isfinite(y[hi]) & ~masked[hi] & ~spike[hi]]
+        if (b - a) <= SAT_REPAIR_MAX_SAMPLES and lo.size >= 1 and hi.size >= 1:
+            k = np.r_[lo, hi]
+            deg = min(3, k.size - 1)
+            c = np.polyfit(k - a, y[k], deg)
+            y[a:b] = np.polyval(c, np.arange(a, b) - a)
+            bridged[a:b] = True
+        else:
+            g = int(round(SAT_GUARD_SEC * fs))
+            masked[max(0, a - g):min(n, b + g)] = True
+    masked &= fin
+    y[masked] = np.nan
+    bridged &= ~masked
+    return y, np.flatnonzero(masked).astype(np.int64), np.flatnonzero(bridged).astype(np.int64)
+
+
+def welch_psd(y, fs, nper):
+    """Gap-aware, one-sided Welch PSD with detrending, averaging ONLY valid runs.
+
+    Every contiguous run begins its OWN Welch grid, so good windows are not
+    incorrectly rejected merely because an unrelated earlier gap shifted the
+    window start. This is essential for long/low-frequency bands.
+    """
+    nper = int(nper)
+    if nper < 8:
+        return None
+    hop = max(1, nper//2)
+    win = np.hanning(nper+1)[:-1]
+    scale = 1.0/(fs*np.sum(win**2))
+    tt = np.arange(nper, dtype=np.float64)-(nper-1)/2.0
+    tt2 = np.dot(tt,tt)
+    acc = np.zeros(nper//2+1, dtype=np.float64)
+    n = 0
+    for start,stop in contiguous_runs(np.isfinite(y)):
+        if stop-start < nper:
+            continue
+        for i in range(start,stop-nper+1,hop):
+            seg = np.asarray(y[i:i+nper], dtype=np.float64)
+            seg = seg - np.mean(seg)
+            seg = seg-tt*(np.dot(seg,tt)/tt2)
+            F = np.fft.rfft(seg*win)
+            acc += (F.real**2+F.imag**2)
+            n += 1
+    if n == 0:
+        return None
+    P = (acc/n)*scale
+    if nper % 2 == 0:
+        P[1:-1] *= 2.0
+    else:
+        P[1:] *= 2.0
+    return P
+
+
+def welch_psd_gapaware(y, fs, nper, min_hz, min_cycles=PSD_MIN_CYCLES):
+    """Find the longest useful window size that fits real contiguous samples.
+
+    No interpolation across absent recordings. Returned PSD has the sample units
+    squared / Hz. Minimum frequency with >= min_cycles in the selected FFT length
+    must be respected by the caller.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    runs = contiguous_runs(np.isfinite(y))
+    if not runs:
+        return None
+    longest = max(b-a for a,b in runs)
+    candidates = [min(int(nper), int(longest))]
+    for factor in PSD_FALLBACK_FACTORS:
+        candidates.append(min(int(longest), int(round(nper*factor))))
+    seen = set()
+    candidates = [n for n in candidates if n > 3 and not (n in seen or seen.add(n))]
+    for n in candidates:
+        if (n / fs) * min_hz < min_cycles:
+
+            continue
+        P = welch_psd(y, fs, n)
+        if P is not None:
+            f = np.fft.rfftfreq(n, d=1.0/fs)
+            return f, P, min_cycles*fs/n, n
+
+    for n in candidates:
+        if n/fs < 1.0:
+            continue
+        P = welch_psd(y, fs, n)
+        if P is not None:
+            f = np.fft.rfftfreq(n, d=1.0/fs)
+            return f, P, min_cycles*fs/n, n
+    return None
+
+
+def rebin_psd_without_fabrication(freq, power, centres, usable, cutoff):
+    """Log-interpolate positive PSD values, excluding unresolved spectral bins.
+
+    Interpolates the *representation* of measured PSD samples, never missing time
+    series data. Do not infer frequencies below the effective FFT resolution.
+    """
+    out = np.full(len(centres), np.nan, dtype=np.float64)
+    valid = np.isfinite(power) & (power > 0) & (freq > 0)
+    if np.count_nonzero(valid) < 2:
+        return out
+    f, p = freq[valid], power[valid]
+    keep = usable & (centres >= max(float(cutoff), float(f[0]))) & (centres <= f[-1])
+    if np.any(keep):
+        out[keep] = np.exp(np.interp(np.log(centres[keep]), np.log(f), np.log(p)))
+    return out
+
+
+def log_map(f_src, centres, edges, use):
+    rows, cols = [], []
+    for j in np.flatnonzero(use):
+        m = np.flatnonzero((f_src >= edges[j]) & (f_src < edges[j + 1]))
+        if m.size == 0:
+            m = np.array([int(np.argmin(np.abs(np.log(np.maximum(f_src, 1e-12)) - np.log(centres[j]))))])
+        rows += [j] * m.size
+        cols += list(m)
+    rows, cols = np.array(rows), np.array(cols)
+    cnt = np.bincount(rows, minlength=len(centres)).astype(float)
+    return rows, cols, cnt
+
+
+def apply_map(P, mp, n_out):
+    rows, cols, cnt = mp
+    out = np.zeros(n_out)
+    np.add.at(out, rows, P[cols])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(cnt > 0, out / cnt, np.nan)
+
+
+def seis_index(paths):
+    from obspy import read
+    ip = os.path.join(CACHE_FOLDER, "seis_index.json")
+    idx = {}
+    if USE_CACHE and os.path.exists(ip) and not _rebuild:
+        try:
+            with open(ip, encoding="utf-8") as fh:
+                idx = json.load(fh)
+        except Exception:
+            idx = {}
+    changed = False
+    out = []
+    for p in paths:
+        k = os.path.abspath(p)
+        st_ = os.stat(p)
+        e = idx.get(k)
+        if e is None or e.get("size") != st_.st_size or (CACHE_CHECK_MTIME and abs(e.get("mtime", -999999) - st_.st_mtime) > 2.5):
+            try:
+                st = read(p, headonly=True)
+                e = {"size": st_.st_size, "mtime": st_.st_mtime, "t0": min(t.stats.starttime.timestamp for t in st),
+                     "t1": max(t.stats.endtime.timestamp for t in st),
+                     "ids": sorted({f"{t.id}|{t.stats.sampling_rate:g}" for t in st})}
+            except Exception as ex:
+                e = {"size": st_.st_size, "mtime": st_.st_mtime, "t0": None, "t1": None, "ids": [], "error": str(ex)}
+            idx[k] = e
+            changed = True
+        out.append((p, e))
+    if changed and USE_CACHE:
+        try:
+            os.makedirs(CACHE_FOLDER, exist_ok=True)
+            with open(ip + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(idx, fh)
+            os.replace(ip + ".tmp", ip)
+        except OSError:
+            pass
+    return out
+
+
+def choose_seis_id(index, ta, tb):
+    import fnmatch
+    pat = f"{SEIS_NETWORK}.{SEIS_STATION}.{SEIS_LOCATION}.{SEIS_CHANNEL}"
+    rates = {}
+    for p, e in index:
+        if e.get("t0") is None or e["t1"] < ta or e["t0"] > tb:
+            continue
+        for s in e["ids"]:
+            i, r = s.split("|")
+            if fnmatch.fnmatchcase(i, pat) and float(r) > 0:
+                rates[i] = float(r)
+    if not rates:
+        raise StopRun(f"no seismic channel {pat} with data in the window (check SEIS_* and the time span)")
+    ids = sorted(rates)
+    if len(ids) > 1:
+        log(f"  ! {len(ids)} seismic channels match {pat}: {', '.join(ids)}; using {ids[0]} (set SEIS_CHANNEL to choose)")
+    return ids[0], rates[ids[0]]
+
+
+def seis_block(index, sid, b0, b1):
+    from obspy import read, UTCDateTime
+    net, sta, loc, cha = sid.split(".")
+    trs = []
+    for p, e in index:
+        if e.get("t0") is None or e["t1"] < b0 or e["t0"] > b1:
+            continue
+        try:
+            st = read(p, starttime=UTCDateTime(b0), endtime=UTCDateTime(b1))
+        except Exception as ex:
+            log(f"  ! {os.path.basename(p)}: {ex}")
+            continue
+        for tr in st.select(network=net, station=sta, location=loc, channel=cha):
+            if waveform_ok(tr) is None:
+                trs.append(tr)
+    if not trs:
+        return None, None
+    main = max({t.stats.sampling_rate for t in trs}, key=lambda r: sum(t.stats.sampling_rate == r for t in trs))
+    trs = sorted([t for t in trs if t.stats.sampling_rate == main], key=lambda t: t.stats.starttime)
+    return traces_window(trs, b0, b1)[0], trs[0]
+
+
+def detrend_log(x):
+    from scipy.ndimage import median_filter
+    lx = np.log10(np.where(x > 0, x, np.nan))
+    ok = np.isfinite(lx)
+    if ok.sum() < 10:
+        return lx
+    filled = np.interp(np.arange(len(lx)), np.flatnonzero(ok), lx[ok])
+    w = max(3, int(round(ENV_DETREND_MIN * 60.0 / RMS_STEP_SEC)) | 1)
+    out = filled - median_filter(filled, size=min(w, len(filled) | 1), mode="nearest")
+    out[~ok] = np.nan
+    return out
+
+
+def env_xcorr(a, b):
+    la, lb = detrend_log(a), detrend_log(b)
+    kmax = int(round(LAG_MAX_SEC / RMS_STEP_SEC))
+    lags = np.arange(-kmax, kmax + 1)
+    r = np.full(len(lags), np.nan)
+    n_used = 0
+    for i, k in enumerate(lags):
+        x, y = (la[k:], lb[:len(lb) - k]) if k >= 0 else (la[:k], lb[-k:])
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.sum() > 20:
+            r[i] = np.corrcoef(x[ok], y[ok])[0, 1]
+            n_used = max(n_used, int(ok.sum()))
+    if not np.isfinite(r).any():
+        return lags * RMS_STEP_SEC, r, np.nan, np.nan, np.nan
+    j = int(np.nanargmax(r))
+    shift = 0.0
+    if 0 < j < len(r) - 1 and np.all(np.isfinite(r[j - 1:j + 2])):
+        den = r[j - 1] - 2 * r[j] + r[j + 1]
+        shift = 0.5 * (r[j - 1] - r[j + 1]) / den if den != 0 else 0.0
+
+
+    return lags * RMS_STEP_SEC, r, float(r[j]), float((lags[j] + shift) * RMS_STEP_SEC), np.nan
+
+
+def row_normalise(P, allowed=None):
+    Q = np.where(allowed, P, 0.0) if allowed is not None else P
+    return P / np.maximum(Q.max(axis=1, keepdims=True), 1e-30)
+
+
+def contrast_of(P, allowed):
+    Q = np.where(allowed, P, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.nanmax(Q, axis=1) / np.maximum(np.nanmean(Q, axis=1), 1e-30)
+
+
+def track(Pn, c, allowed, smooth):
+    nf, nc = Pn.shape
+    score = np.where(allowed, Pn, -1.0)
+    jump = smooth * np.abs(np.arange(nc)[:, None] - np.arange(nc)[None, :])
+    cost = score[0].copy()
+    back = np.zeros((nf, nc), dtype=np.int32)
+    for i in range(1, nf):
+        tot = cost[None, :] - jump
+        back[i] = np.argmax(tot, axis=1)
+        cost = tot[np.arange(nc), back[i]] + score[i]
+    j = np.zeros(nf, dtype=int)
+    j[-1] = int(np.argmax(cost))
+    for i in range(nf - 1, 0, -1):
+        j[i - 1] = back[i][j[i]]
+    cp = c[j].astype(float)
+    lo, hi = np.full(nf, np.nan), np.full(nf, np.nan)
+    dc = c[1] - c[0]
+    for i in range(nf):
+        jj = j[i]
+        if 0 < jj < nc - 1:
+            y0, y1, y2 = Pn[i, jj - 1], Pn[i, jj], Pn[i, jj + 1]
+            den = y0 - 2 * y1 + y2
+            if den < 0 and y1 >= y0 and y1 >= y2:
+                cp[i] = c[jj] + float(np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5)) * dc
+        a = b = jj
+        while a > 0 and Pn[i, a - 1] >= 0.5 * Pn[i, jj]:
+            a -= 1
+        while b < nc - 1 and Pn[i, b + 1] >= 0.5 * Pn[i, jj]:
+            b += 1
+        lo[i], hi[i] = c[a], c[b]
+    peak = Pn[np.arange(nf), j]
+    on = allowed[np.arange(nf), j]
+    return dict(c=cp, lo=lo, hi=hi, j=j, peak=peak, on=on)
+
+
+def reliability(T, contrast, q_thresh, split, tol, c, Praw, art=None, max_jump=None):
+    Pm = np.where(art, 0.0, Praw) if art is not None else Praw
+    glob_ratio = Pm[np.arange(len(T["j"])), T["j"]] / np.maximum(Pm.max(axis=1), 1e-30)
+    T["global_ratio"] = glob_ratio
+    ok = T["on"] & (contrast >= q_thresh) & (T["peak"] >= 0.5) & (glob_ratio >= 0.5)
+    ok &= (T["c"] > c[0] + (c[1] - c[0])) & (T["c"] < c[-1] - (c[1] - c[0]))
+    ok &= (T["hi"] - T["lo"]) / np.maximum(T["c"], 1e-9) < 0.6
+    if split is not None:
+        diff = np.abs(split[0]["c"] - split[1]["c"])
+        ok &= diff <= tol * T["c"]
+        T["lo"] = np.minimum(T["lo"], T["c"] - diff)
+        T["hi"] = np.maximum(T["hi"], T["c"] + diff)
+        T["split_diff"] = diff
+    if max_jump and ok.sum() >= 5:
+        from scipy.ndimage import median_filter
+        idx = np.flatnonzero(ok)
+        med = median_filter(T["c"][idx], size=min(9, len(idx) | 1), mode="nearest")
+        ok[idx[np.abs(T["c"][idx] - med) > max_jump * med]] = False
+    T["ok"] = ok
+    return T
+
+
+def broken_xy(x, y, ok, tol=0.10):
+    xs, ys = [], []
+    prev = None
+    for xi, yi, oi in zip(x, y, ok):
+        if not oi or not np.isfinite(yi):
+            xs.append(xi)
+            ys.append(np.nan)
+            prev = None
+            continue
+        if prev is not None and abs(yi - prev) > tol * prev:
+            xs.append(xi)
+            ys.append(np.nan)
+        xs.append(xi)
+        ys.append(yi)
+        prev = yi
+    return np.array(xs), np.array(ys)
+
+
+def tone_rows(P, f):
+    from scipy.ndimage import median_filter
+    w = max(3, int(round(TONE_WIN_HZ / max(f[1] - f[0], 1e-9))) | 1)
+    bad = np.zeros(len(f), dtype=bool)
+    for v in (np.median(P, axis=1), P.max(axis=1)):
+        ref = median_filter(v, size=w, mode="nearest")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            bad |= 10 * np.log10(v / np.maximum(ref, 1e-30)) > TONE_DB
+    return bad
+
+
+def notch(P, bad):
+    if not bad.any() or bad.all():
+        return P
+    good = np.flatnonzero(~bad)
+    out = P.copy()
+    for i in np.flatnonzero(bad):
+        j = np.searchsorted(good, i)
+        lo = good[max(0, j - 1)]
+        hi = good[min(len(good) - 1, j)]
+        if lo == hi:
+            out[i] = P[lo]
+        else:
+            w = (i - lo) / (hi - lo)
+            out[i] = (1 - w) * P[lo] + w * P[hi]
+    return out
+
+
+def noise_floor(P, k, kmin, dx):
+    sel = (np.abs(k) >= kmin) & (np.abs(k) <= 0.5 / dx)
+    return np.median(P[:, sel], axis=1)
+
+
+def fk_to_fc_wrap(P, f, k, c, sign, dx):
+    kn = 0.5 / dx
+    order = np.argsort(k)
+    ks = k[order]
+    out = np.zeros((len(f), len(c)))
+    for i, fi in enumerate(f):
+        kt = sign * fi / c
+        kw = ((kt + kn) % (2.0 * kn)) - kn
+        out[i] = np.interp(kw, ks, P[i, order])
+    return out
+
+
+def check_settings():
+    for k in ("SELECTED_DIST_M", "C_HALF_APERTURE_M", "C_FILES_MAX", "C_WIN_SEC", "C_FMIN", "C_NF", "C_MIN", "C_MAX",
+              "C_NC", "C_Q_THRESH", "C_MIN_WAVELENGTHS", "C_SMOOTHNESS", "C_SPLIT_TOL", "C_MAX_JUMP", "C_MAX_GAP",
+              "TONE_DB", "TONE_WIN_HZ", "F_MIN", "CELL_SEC", "TIER_BLEND", "N_FREQ_BINS", "MIN_COVERAGE", "RMS_STEP_SEC",
+              "ENV_DETREND_MIN", "BLOCK_MIN", "LAG_MAX_SEC", "DPI_SAVE", "JPEG_QUALITY"):
+        v = globals()[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+            raise StopRun(f"{k} = {v!r} is not a number")
+    if SPEC_DISPLAY not in ("robust", "relative", "absolute"):
+        raise StopRun('SPEC_DISPLAY must be "robust", "relative" or "absolute"')
+    if not (RMS_BAND == "auto" or (isinstance(RMS_BAND, (list, tuple)) and len(RMS_BAND) == 2)):
+        raise StopRun('RMS_BAND must be "auto" or (f_low, f_high)')
+    for t in TIERS:
+        if len(t) != 4 or t[2] * 2 > t[3] + 1e-9:
+            raise StopRun("every TIERS entry is (f_low, f_high or None, segment_sec, context_sec) with context >= 2 segments")
+    if not response_files():
+        raise StopRun("RESPONSE_FILE finds no StationXML: the seismometer response must come from metadata")
+    if RESPONSE_MATCH not in ("exact", "auto"):
+        raise StopRun('RESPONSE_MATCH must be "exact" or "auto"')
+    if not CABLE or re.search(r"[\\/:*?\"<>|\s]", str(CABLE)):
+        raise StopRun("CABLE is a label for file names: letters, digits, - and _ only")
+    if PHASE_WRAPPED not in ("auto", True, False):
+        raise StopRun('PHASE_WRAPPED must be "auto", True or False')
+    if not 0.1 <= float(PHASE_SAT_FRACTION) <= 1.0:
+        raise StopRun("PHASE_SAT_FRACTION must be between 0.1 and 1")
+
+
+def decimate_nan(y, fs, fs_t):
+    """Polyphase decimation of each observed contiguous span, never across gaps.
+
+    Returns NaNs for missing data. Long filters are not allowed to mix separate
+    acquired segments across an unobserved interval.
+    """
+    from scipy.signal import resample_poly
+    q = max(1, int(np.floor(fs / fs_t)))
+    y = np.asarray(y, dtype=np.float64)
+    if q == 1:
+        return y, fs
+    nout = (len(y) + q - 1) // q
+    out = np.full(nout, np.nan, dtype=np.float64)
+    good = np.isfinite(y)
+    for left, right in contiguous_runs(good):
+
+        first = (left + q - 1) // q
+        last = right // q
+        if last <= first:
+            continue
+        sl = y[first*q:last*q]
+        if len(sl) < 4*q:
+            continue
+        filt = resample_poly(sl, 1, q)
+
+        if len(filt) > 4:
+            out[first+2:min(last-2, first+len(filt)-2)] = filt[2:max(2, min(len(filt)-2, last-first-2))]
+    return out, fs/q
+
+
+def tier_setup(fs, fny):
+    out = []
+    for i, (flo, fhi, seg, ctx) in enumerate(TIERS):
+        hi = fny if fhi is None else min(fhi, fny)
+        if flo >= hi:
+            continue
+        lo_b = flo / (TIER_BLEND if i > 0 else 1.0)
+        hi_b = hi * (TIER_BLEND if fhi is not None else 1.0)
+        fs_t = fs if fhi is None else min(fs, 4.0 * min(hi_b, fny))
+        q = max(1, int(np.floor(fs / fs_t)))
+        out.append(dict(flo=flo, fhi=hi, lo_b=lo_b, hi_b=min(hi_b, fny), seg=seg, ctx=ctx, q=q, fs=fs / q,
+                        nper=int(round(seg * fs / q)), last=fhi is None))
+    return out
+
+
+def tier_weights(centres, tiers):
+    W = np.zeros((len(tiers), len(centres)))
+    for i, t in enumerate(tiers):
+        lc = np.log(centres)
+        w = ((centres >= t["lo_b"]) & (centres <= t["hi_b"])).astype(float)
+        if i > 0:
+            a, b = np.log(t["lo_b"]), np.log(t["flo"] * TIER_BLEND)
+            m = (lc >= a) & (lc < b)
+            w[m] = 0.5 - 0.5 * np.cos(np.pi * (lc[m] - a) / max(b - a, 1e-9))
+        if not t["last"]:
+            a, b = np.log(t["fhi"] / TIER_BLEND), np.log(t["hi_b"])
+            m = (lc > a) & (lc <= b)
+            w[m] = 0.5 + 0.5 * np.cos(np.pi * (lc[m] - a) / max(b - a, 1e-9))
+        W[i] = w
+    s = W.sum(axis=0)
+    return W / np.where(s > 0, s, 1.0)
+
+
+def measure_c(stamped, file_sec, ta, tb, L):
+    from scipy.signal import detrend
+    from scipy.signal.windows import hann, tukey
+    dx, fs = L["dx"], L["fs"]
+    x0 = x0_of(L)
+    jc = int(round((SELECTED_DIST_M - x0) / dx))
+    h = int(round(C_HALF_APERTURE_M / dx))
+    chans = np.arange(max(0, jc - h), min(L["n_ch"] - 1, jc + h) + 1)
+    sel = [p for p, ts in stamped if ta <= to_posix(ts) < tb]
+    if len(sel) > C_FILES_MAX:
+        sel = [sel[i] for i in np.linspace(0, len(sel) - 1, int(C_FILES_MAX)).round().astype(int)]
+    key = hashlib.md5(json.dumps(dict(files=[(os.path.basename(p), os.path.getsize(p)) for p in sel], ch=[int(chans[0]), int(chans[-1])],
+                                      w=C_WIN_SEC, f=[C_FMIN, C_NF], c=[C_MIN, C_MAX, C_NC], q=C_Q_THRESH, mw=C_MIN_WAVELENGTHS,
+                                      s=C_SMOOTHNESS, st=C_SPLIT_TOL, mj=C_MAX_JUMP, gap=C_MAX_GAP, t=[TONE_DB, TONE_WIN_HZ],
+                                      cable=CABLE, reader=reader_tag(), off=DISTANCE_OFFSET_M, v=CACHE_VERSION, sat=sat_settings_tag()), sort_keys=True).encode()).hexdigest()[:12]
+    for folder in (cache_folders() if USE_CACHE and not _rebuild else []):
+        cand = os.path.join(folder, "results", f"cmeas_{key}.npz")
+        if os.path.exists(cand):
+            try:
+                with np.load(cand, allow_pickle=False) as hh:
+                    log(f"  C(f) from the result cache ({os.path.basename(cand)})")
+                    return {k: hh[k] for k in hh.files}
+            except Exception:
+                pass
+    nwin = int(round(C_WIN_SEC * fs))
+    nch = len(chans)
+    fall = np.fft.rfftfreq(nwin, 1.0 / fs)
+    fm = (fall >= C_FMIN) & (fall <= fs / 2.0)
+    nk = int(2 ** np.ceil(np.log2(nch * 4)))
+    k = np.fft.fftshift(np.fft.fftfreq(nk, dx))
+    tt = hann(nwin)[:, None]
+    xt = tukey(nch, 0.5)[None, :]
+    acc = np.zeros((2, int(fm.sum()), nk))
+    nh = np.zeros(2, dtype=int)
+    t_run = time.time()
+    for i, p in enumerate(sel):
+        try:
+            X, t0, _ = read_file(p, chans)
+        except Exception as e:
+            log(f"  ! {os.path.basename(p)}: {e}")
+            continue
+        for s0 in range(0, len(X) - nwin + 1, nwin // 2):
+            w = X[s0:s0 + nwin]
+            if np.isnan(w).any():
+                continue
+            w = detrend(w.astype(np.float64), axis=0)
+            sd = w.std(axis=0)
+            w = w / np.where(sd > 0, sd, 1.0)[None, :]
+            U = np.fft.rfft(w * tt, axis=0)[fm] * xt
+            K = np.fft.fftshift(np.fft.ifft(U, n=nk, axis=1) * nk, axes=1)
+            hf = int(np.floor((t0 + s0 / fs) / C_WIN_SEC * 2 + 1e-6)) % 2
+            acc[hf] += K.real ** 2 + K.imag ** 2
+            nh[hf] += 1
+        if (i + 1) % 10 == 0 or i + 1 == len(sel):
+            log(f"  C(f): {i + 1}/{len(sel)} files  ({time.time() - t_run:.0f} s)")
+    if nh.min() < 2:
+        raise StopRun("C(f): too few complete windows around the selected channel")
+    f = fall[fm]
+    P = acc.sum(axis=0) / nh.sum()
+    Ph = [acc[j] / nh[j] for j in range(2)]
+    tones = tone_rows(P, f)
+    if tones.any():
+        P = notch(P, tones)
+        Ph = [notch(H, tones) for H in Ph]
+    aperture = (nch - 1) * dx
+    kmin = C_MIN_WAVELENGTHS / aperture
+    E = np.maximum(P - noise_floor(P, k, kmin, dx)[:, None], 0.0)
+    Eh = [np.maximum(H - noise_floor(H, k, kmin, dx)[:, None], 0.0) for H in Ph]
+    idx = np.unique(np.searchsorted(f, np.geomspace(f[0], f[-1], int(C_NF))).clip(0, len(f) - 1))
+    fs_ = f[idx]
+    c = np.linspace(C_MIN, C_MAX, int(C_NC))
+    gl = L.get("gauge_m")
+    curves = []
+    for sign in (1, -1):
+        Pc = fk_to_fc_wrap(E[idx], fs_, k, c, sign, dx)
+        Pr = fk_to_fc_wrap(P[idx], fs_, k, c, sign, dx)
+        allowed = (c[None, :] >= 2.0 * dx * fs_[:, None]) & (fs_[:, None] * aperture / c[None, :] >= C_MIN_WAVELENGTHS)
+        if gl:
+            allowed &= fs_[:, None] / c[None, :] < 0.9 / gl
+        Pn = row_normalise(Pc, allowed)
+        T = track(Pn, c, allowed, C_SMOOTHNESS)
+        split = [track(row_normalise(fk_to_fc_wrap(H[idx], fs_, k, c, sign, dx), allowed), c, allowed, C_SMOOTHNESS) for H in Eh]
+        T = reliability(T, contrast_of(Pr, allowed), C_Q_THRESH, split, C_SPLIT_TOL, c, Pr, None, C_MAX_JUMP)
+        curves.append(T)
+    a, b = curves
+    cc = np.full(len(fs_), np.nan)
+    lo = np.full(len(fs_), np.nan)
+    hi = np.full(len(fs_), np.nan)
+    both = a["ok"] & b["ok"]
+    cc[both] = np.sqrt(a["c"][both] * b["c"][both])
+    for T in (a, b):
+        only = T["ok"] & ~both
+        cc[only] = T["c"][only]
+    for i in range(len(fs_)):
+        vals = [T for T in (a, b) if T["ok"][i]]
+        if vals:
+            lo[i] = min(T["lo"][i] for T in vals)
+            hi[i] = max(T["hi"][i] for T in vals)
+    ok = np.isfinite(cc)
+    band = (np.nan, np.nan)
+    c_fill = np.full(len(fs_), np.nan)
+    if ok.sum() >= 5:
+        idx_ok = np.flatnonzero(ok)
+        runs, start = [], idx_ok[0]
+        for p_, q_ in zip(idx_ok[:-1], idx_ok[1:]):
+            if fs_[q_] / fs_[p_] - 1.0 > C_MAX_GAP:
+                runs.append((start, p_))
+                start = q_
+        runs.append((start, idx_ok[-1]))
+        r0, r1 = max(runs, key=lambda r: np.log(fs_[r[1]] / fs_[r[0]]) if r[1] > r[0] else -1)
+        seg = ok.copy()
+        seg[:r0] = False
+        seg[r1 + 1:] = False
+        if seg.sum() >= 5:
+            band = (float(fs_[r0]), float(fs_[r1]))
+            m = (fs_ >= band[0]) & (fs_ <= band[1])
+            c_fill[m] = np.exp(np.interp(np.log(fs_[m]), np.log(fs_[seg]), np.log(cc[seg])))
+    inb = (fs_ >= band[0]) & (fs_ <= band[1]) if np.isfinite(band).all() else np.zeros(len(fs_), dtype=bool)
+    res = dict(f=fs_, c=np.where(inb, cc, np.nan), lo=np.where(inb, lo, np.nan), hi=np.where(inb, hi, np.nan),
+               ok=ok & inb, c_fill=c_fill, band=np.array(band), fwd=a["c"], bwd=b["c"],
+               fwd_ok=a["ok"] & inb, bwd_ok=b["ok"] & inb, outside=ok & ~inb, n_windows=nh, n_files=len(sel), ch0=int(chans[0]), ch1=int(chans[-1]),
+               aperture=aperture, tones=f[tones])
+    if USE_CACHE:
+        try:
+            rp = os.path.join(CACHE_FOLDER, "results", f"cmeas_{key}.npz")
+            os.makedirs(os.path.dirname(rp), exist_ok=True)
+            with open(rp + ".tmp", "wb") as fh:
+                np.savez(fh, **res)
+            os.replace(rp + ".tmp", rp)
+        except OSError as e:
+            log(f"  ! cannot write the result cache ({e})")
+    return res
+
+
+def c_at(C, fq):
+    if not np.isfinite(C["band"]).all():
+        return np.full(len(fq), np.nan)
+    m = (fq >= C["band"][0]) & (fq <= C["band"][1])
+    out = np.full(len(fq), np.nan)
+    good = np.isfinite(C["c_fill"])
+    out[m] = np.exp(np.interp(np.log(fq[m]), np.log(C["f"][good]), np.log(C["c_fill"][good])))
+    return out
+
+
+def rms_band(C, fny_s, fny_d):
+    if RMS_BAND != "auto":
+        return float(RMS_BAND[0]), float(RMS_BAND[1])
+    if not np.isfinite(C["band"]).all():
+        return None
+    a = max(float(C["band"][0]), 2.0 / RMS_STEP_SEC)
+    b = min(float(C["band"][1]), 0.95 * fny_s, 0.95 * fny_d)
+    return (a, b) if b > a * 1.2 else None
+
+
+def seis_vel_gain(inv, tr, f):
+    """Counts PSD -> velocity PSD gain, with response water-level and taper.
+
+    Invalid frequencies including above instrument Nyquist get zero gain.
+    """
+    f = np.asarray(f, dtype=np.float64)
+    g = np.zeros(len(f), dtype=np.float64)
+    nyq = 0.5 * float(tr.stats.sampling_rate)
+    hi1 = SEIS_PREFILT_HIGH_FRACTION[0]*nyq
+    hi2 = SEIS_PREFILT_HIGH_FRACTION[1]*nyq
+    ok = (f >= SEIS_PREFILT_LO_HZ[0]) & (f < hi2) & (f > 0)
+    if not np.any(ok):
+        return g
+    H = np.asarray(response_for(inv, tr)[0].get_evalresp_response_for_frequencies(f[ok], output='VEL'))
+    ampsq = np.abs(H)**2
+    good = np.isfinite(ampsq) & (ampsq > 0)
+    if not np.any(good):
+        return g
+    floor = max(float(np.nanmax(ampsq[good])) * 10**(-SEIS_RESPONSE_WATERLEVEL_DB/10), 1e-300)
+    ff = f[ok]
+    taper = np.ones(len(ff))
+    a,b = SEIS_PREFILT_LO_HZ
+    m = ff < b
+    taper[m] = np.sin(0.5*np.pi*np.clip((ff[m]-a)/max(b-a,1e-12),0,1))**2
+    m = ff > hi1
+    taper[m] = np.cos(0.5*np.pi*np.clip((ff[m]-hi1)/max(hi2-hi1,1e-12),0,1))**2
+    gain = (taper**2)/np.maximum(ampsq, floor)
+    gain[~good] = 0
+    g[ok] = gain
+    return g
+
+
+def envelope(y, fs, gain, df):
+    n = int(round(RMS_STEP_SEC * fs))
+    k = len(y) // n
+    if k == 0:
+        return np.zeros(0)
+    Y = y[:k * n].reshape(k, n)
+    bad = np.isnan(Y).any(axis=1)
+    Y = np.where(bad[:, None], 0.0, Y)
+    Y = Y - Y.mean(axis=1, keepdims=True)
+    win = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)
+    F = np.fft.rfft(Y * win, axis=1)
+    P = (F.real ** 2 + F.imag ** 2) * (2.0 / (fs * np.sum(win ** 2)))
+    r = np.sqrt(np.sum(P * gain[None, :], axis=1) * df) * 1e6
+    r[bad] = np.nan
+    return r
+
+
+def diff_gain(f, L):
+    """1 / sinc^2(f/fs): undoes the roll-off of the first difference used to turn
+    phase (or strain) into strain rate. 1 for data recorded as a rate."""
+    if not DAS_DIFF_CORRECTION or L.get("unit_kind") not in ("phase", "strain"):
+        return np.ones(len(np.atleast_1d(f)))
+    s = np.sinc(np.asarray(f, dtype=np.float64) / float(L["fs"]))
+    return 1.0 / np.maximum(s, 0.3) ** 2
+
+
+def compute(stamped, file_sec, ta, tb, L, index, sid, fs_s, inv, C):
+    fs_d = L["fs"]
+    fny_d, fny_s = fs_d / 2.0, fs_s / 2.0
+    g0 = np.floor(ta / CELL_SEC) * CELL_SEC
+    n_cells = int(np.ceil((tb - g0) / CELL_SEC))
+    band = rms_band(C, fny_s, fny_d)
+    files = [(os.path.basename(p), os.path.getsize(p)) for p in files_between(stamped, file_sec, ta, tb)]
+    key = hashlib.md5(json.dumps(dict(files=files, seis=[(os.path.basename(p), e.get("size")) for p, e in index],
+                                      sid=sid, ta=ta, tb=tb, dist=SELECTED_DIST_M, cell=CELL_SEC, tiers=TIERS, bl=TIER_BLEND,
+                                      nb=N_FREQ_BINS, fmin=F_MIN, env=[RMS_STEP_SEC, band], dc=DAS_DIFF_CORRECTION,
+                                      cf=np.round(np.nan_to_num(C["c_fill"]), 2).tolist(),
+                                      resp=[os.path.basename(x) for x in response_files()], cable=CABLE, reader=reader_tag(),
+                                      off=DISTANCE_OFFSET_M, v=CACHE_VERSION, sat=sat_settings_tag()), sort_keys=True, default=str).encode()).hexdigest()[:12]
+    for folder in (cache_folders() if USE_CACHE and not _rebuild else []):
+        cand = os.path.join(folder, "results", f"dasseis3_{key}.npz")
+        if os.path.exists(cand):
+            try:
+                with np.load(cand, allow_pickle=False) as h:
+                    log(f"  spectrograms from the result cache ({os.path.basename(cand)})")
+                    return {k: h[k] for k in h.files}
+            except Exception:
+                pass
+    edges = np.geomspace(F_MIN, min(F_MAX, fny_d*0.99), int(N_FREQ_BINS) + 1)
+    centres = np.sqrt(edges[:-1] * edges[1:])
+    inst = {}
+    for name, fs, fny in (("d", fs_d, fny_d), ("s", fs_s, fny_s)):
+        tiers = tier_setup(fs, fny)
+        for t in tiers:
+            ft = np.fft.rfftfreq(t["nper"], 1.0 / t["fs"])
+            use = (centres >= t["lo_b"]) & (centres <= t["hi_b"])
+            t["f"] = ft
+            t["map"] = log_map(ft, centres, edges, use)
+            t["use"] = use
+        ne = int(round(RMS_STEP_SEC * fs))
+        fe = np.fft.rfftfreq(ne, 1.0 / fs)
+        inst[name] = dict(fs=fs, fny=fny, tiers=tiers, W=tier_weights(centres, tiers), fe=fe, inb=centres <= fny)
+        if name == "d":
+            ce = c_at(C, fe)
+            g = np.zeros(len(fe))
+            if band is not None:
+                m = (fe >= band[0]) & (fe <= band[1]) & np.isfinite(ce) & (fe > 0)
+                g[m] = DAS_STRAIN_RATE_TO_STRAIN_PER_S**2 * ce[m] ** 2 / (2.0 * np.pi * fe[m]) ** 2 * diff_gain(fe[m], L)
+            inst[name]["ge"] = g
+    pad = max(t["ctx"] for t in inst["d"]["tiers"]) / 2.0
+    S_d = np.full((n_cells, len(centres)), np.nan, dtype=np.float32)
+    S_s = np.full((n_cells, len(centres)), np.nan, dtype=np.float32)
+    cov_d, cov_s = np.zeros(n_cells), np.zeros(n_cells)
+    tier_cov_d = np.zeros((len(inst["d"]["tiers"]), n_cells), dtype=bool)
+    tier_cov_s = np.zeros((len(inst["s"]["tiers"]), n_cells), dtype=bool)
+    spc = int(round(CELL_SEC / RMS_STEP_SEC))
+    env_d = np.full(n_cells * spc, np.nan)
+    env_s = np.full(n_cells * spc, np.nan)
+
+    satc = {k: np.zeros((2, n_cells), dtype=np.float32) for k in ("d", "s")}
+    cells_per_block = max(1, int(round(BLOCK_MIN * 60.0 / CELL_SEC)))
+    n_blocks = int(np.ceil(n_cells / cells_per_block))
+    ch_used = None
+    t_run = time.time()
+    for bi, c0 in enumerate(range(0, n_cells, cells_per_block), 1):
+        c1 = min(n_cells, c0 + cells_per_block)
+        b0, b1 = g0 + c0 * CELL_SEC, g0 + c1 * CELL_SEC
+        yd, ch, fl_d = das_window(stamped, file_sec, b0 - pad, b1 + pad, SELECTED_DIST_M, fs_d)
+        ch_used = ch if ch is not None else ch_used
+        ys, tr0 = seis_block(index, sid, b0 - pad, b1 + pad)
+        fl_s = None
+        if ys is not None:
+            ys, im, ib = fix_saturation(ys, fs_s, "seis")
+            fl_s = np.zeros(len(ys), dtype=np.int8)
+            fl_s[ib] = 1
+            fl_s[im] = 2
+        if tr0 is not None and "ge" not in inst["s"]:
+            I = inst["s"]
+            fe = I["fe"]
+            g = np.zeros(len(fe))
+            if band is not None:
+                m = (fe >= band[0]) & (fe <= band[1])
+                g[m] = seis_vel_gain(inv, tr0, fe[m])
+            I["ge"] = g
+            for t in I["tiers"]:
+                t["gain"] = seis_vel_gain(inv, tr0, t["f"])
+        for name, y, S, cov, env, fl in (("d", yd, S_d, cov_d, env_d, fl_d), ("s", ys, S_s, cov_s, env_s, fl_s)):
+            if y is None:
+                continue
+            I = inst[name]
+            if name == "s" and "ge" not in I:
+                continue
+            fs = I["fs"]
+            ipad, nc = int(round(pad * fs)), int(round(CELL_SEC * fs))
+            core = y[ipad:ipad + (c1 - c0) * nc]
+            if len(core) != (c1-c0)*nc:
+                log(f"  ! {name}: incomplete block core: expected {(c1-c0)*nc} samples, got {len(core)}")
+            e = envelope(core, fs, I["ge"], 1.0 / RMS_STEP_SEC)
+            env[c0 * spc:c0 * spc + len(e)] = e
+            for c in range(c0, c1):
+                cell = core[(c - c0) * nc:(c - c0 + 1) * nc]
+                cov[c] = np.isfinite(cell).mean() if cell.size else 0.0
+                fc = fl[ipad + (c - c0) * nc:ipad + (c - c0 + 1) * nc]
+                if fc.size:
+                    satc[name][0, c] = np.mean(fc == 1)
+                    satc[name][1, c] = np.mean(fc == 2)
+            lay = []
+            for t in I["tiers"]:
+                yt, fst = decimate_nan(y, fs, t["fs"]) if t["q"] > 1 else (y, fs)
+                lay.append((t, yt, fst))
+            for c in range(c0, c1):
+                if cov[c] < MIN_COVERAGE:
+                    continue
+                tc = (c - c0 + 0.5) * CELL_SEC + pad
+                acc = np.zeros(len(centres))
+                wsum = np.zeros(len(centres))
+                for ti, (t, yt, fst) in enumerate(lay):
+                    i0 = int(round((tc - t["ctx"] / 2.0) * fst))
+                    seg = yt[max(0, i0):max(0, i0) + int(round(t["ctx"] * fst))]
+                    result = welch_psd_gapaware(seg, fst, t["nper"], t["flo"])
+                    if result is None:
+                        continue
+                    fp, P, fcut, n_used = result
+                    if name == "s":
+
+
+                        if n_used == t["nper"]:
+                            P = P * t["gain"]
+                        else:
+                            P = P * seis_vel_gain(inv, tr0, fp)
+                    else:
+                        P = P * diff_gain(fp, L)
+                    v = rebin_psd_without_fabrication(fp, P, centres, t["use"], fcut)
+                    if np.isfinite(v).any():
+                        (tier_cov_d if name == "d" else tier_cov_s)[ti, c] = True
+                    w = I["W"][ti] * np.isfinite(v)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        acc += np.where(w > 0, w * np.log(np.maximum(v, 1e-300)), 0.0)
+                    wsum += w
+                out = np.where((wsum > 0.35) & I["inb"], np.exp(acc / np.maximum(wsum, 1e-12)), np.nan)
+                S[c] = out.astype(np.float32)
+        log(f"  block {bi}/{n_blocks} {from_posix(b0):%Y-%m-%d %H:%M}  ({time.time() - t_run:.0f} s)")
+    db_save()
+    res = dict(f=centres, fedges=edges, t=g0 + np.arange(n_cells) * CELL_SEC, S_d=S_d, S_s=S_s, cov_d=cov_d, cov_s=cov_s,
+               env_t=g0 + (np.arange(n_cells * spc) + 0.5) * RMS_STEP_SEC, env_d=env_d, env_s=env_s,
+               ch=-1 if ch_used is None else ch_used, fs_d=fs_d, fs_s=fs_s,
+               band=np.array(band if band is not None else (np.nan, np.nan)),
+               tier_cov_d=tier_cov_d, tier_cov_s=tier_cov_s, sat_d=satc["d"], sat_s=satc["s"])
+    if USE_CACHE:
+        try:
+            rp = os.path.join(CACHE_FOLDER, "results", f"dasseis3_{key}.npz")
+            os.makedirs(os.path.dirname(rp), exist_ok=True)
+            with open(rp + ".tmp", "wb") as fh:
+                np.savez(fh, **res)
+            os.replace(rp + ".tmp", rp)
+        except OSError as e:
+            log(f"  ! cannot write the result cache ({e})")
+    return res
+
+
+def display(S, scale):
+    import warnings
+    with np.errstate(divide='ignore', invalid='ignore'):
+        D = 10.0*np.log10(np.where(S > 0, S*scale, np.nan))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        if SPEC_DISPLAY == 'absolute':
+            return D, None
+        med = np.nanmedian(D, axis=0, keepdims=True)
+        if SPEC_DISPLAY == 'relative':
+            return D-med, None
+        mad = 1.4826*np.nanmedian(np.abs(D-med), axis=0, keepdims=True)
+
+
+        k = int(SPEC_MAD_SMOOTH_BINS) // 2
+        if k > 0:
+            m0 = mad[0]
+            sm = np.array([np.nanmedian(m0[max(0, i - k):i + k + 1]) if np.isfinite(m0[max(0, i - k):i + k + 1]).any()
+                           else np.nan for i in range(len(m0))])
+            mad = np.where(np.isfinite(sm), np.fmax(sm, m0), m0)[None, :]
+        return (D-med)/np.maximum(mad, SPEC_MAD_FLOOR_DB), mad
+
+
+def panel_clim(E):
+    """v3: colour limits that fit the data instead of a fixed (-3, 6).
+
+    The limits are the SPEC_CLIM_PCT percentiles of the panel; in "robust" mode
+    they are never narrower than SPEC_ROBUST_CLIM, so a quiet record is not
+    stretched into noise. Returns ((vmin, vmax), percent outside, norm)."""
+    from matplotlib.colors import Normalize
+    v = E[np.isfinite(E)]
+    if not v.size:
+        return (-1.0, 1.0), 0.0, Normalize(-1.0, 1.0)
+    lo, hi = (float(np.percentile(v, SPEC_CLIM_PCT[0])), float(np.percentile(v, SPEC_CLIM_PCT[1])))
+    if SPEC_DISPLAY == "robust":
+        lo, hi = min(lo, SPEC_ROBUST_CLIM[0]), max(hi, SPEC_ROBUST_CLIM[1])
+    if hi <= lo:
+        hi = lo + 1.0
+    clim = (lo, hi)
+    if SPEC_COLOR_SCALE == "asinh" and SPEC_DISPLAY != "absolute":
+        try:
+            from matplotlib.colors import AsinhNorm
+            norm = AsinhNorm(linear_width=float(SPEC_ASINH_WIDTH), vmin=lo, vmax=hi)
+        except ImportError:
+            from matplotlib.colors import SymLogNorm
+            norm = SymLogNorm(linthresh=float(SPEC_ASINH_WIDTH), vmin=lo, vmax=hi, base=10)
+    else:
+        norm = Normalize(vmin=lo, vmax=hi)
+    return clim, 100.0 * np.mean((v < clim[0]) | (v > clim[1])), norm
+
+
+def plot(res, C, L, sid, ta, tb):
+    import warnings
+    fe, t = res["fedges"], res["t"]
+    fny_s = res["fs_s"] / 2.0
+    band = res["band"]
+    Ed, _ = display(res["S_d"], 1.0)
+    Es, _ = display(res["S_s"], 1e12)
+    (cl_d, sat_d, nm_d), (cl_s, sat_s, nm_s) = panel_clim(Ed), panel_clim(Es)
+    rec_d = res["sat_d"] if "sat_d" in res else np.zeros((2, len(res["t"])))
+    rec_s = res["sat_s"] if "sat_s" in res else np.zeros((2, len(res["t"])))
+    ed, es, et = res["env_d"], res["env_s"], res["env_t"]
+    have_band = np.isfinite(band).all()
+    lag_s, r, rmax, lag_best, r_sig = env_xcorr(ed, es) if have_band else (np.zeros(1), np.full(1, np.nan), np.nan, np.nan, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        both = np.isfinite(ed) & np.isfinite(es) & (es > 0) & (ed > 0)
+        ratio = float(np.nanmedian(ed[both] / es[both])) if (both.any() and have_band) else np.nan
+    te = mdates.date2num([from_posix(x) for x in np.r_[t, t[-1] + CELL_SEC]])
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": FONT_AXIS_TICKS,
+        "axes.labelsize": FONT_AXIS_LABEL,
+        "axes.titlesize": FONT_MAIN_TITLE,
+        "xtick.labelsize": FONT_AXIS_TICKS,
+        "ytick.labelsize": FONT_AXIS_TICKS,
+        "legend.fontsize": FONT_ANNOTATION,
+    })
+    fig = plt.figure(figsize=FIG_SIZE)
+    gs = gridspec.GridSpec(6, 3, width_ratios=[1, 0.55, 0.015], height_ratios=[2.6, 0.9, 0.9, 2.6, 0.32, 1.5], hspace=0.16,
+                           wspace=0.12)
+    ax1 = fig.add_subplot(gs[0, 0:2])
+    ax2 = fig.add_subplot(gs[1, 0:2], sharex=ax1)
+    ax3 = fig.add_subplot(gs[2, 0:2], sharex=ax1)
+    ax4 = fig.add_subplot(gs[3, 0:2], sharex=ax1)
+    ax5 = fig.add_subplot(gs[5, 0:2])
+    cmap = matplotlib.colormaps[CMAP_SPEC].copy()
+    cmap.set_bad("0.85")
+    labs = {"robust": "deviation dB - median",
+            "relative": "dB re median of each frequency"}
+    gl = L.get("gauge_m")
+    tmid = mdates.date2num([from_posix(x + 0.5 * CELL_SEC) for x in t])
+    for ax, cax, E, cl, sat, nm, rec, txt, lab_abs in (
+            (ax1, fig.add_subplot(gs[0, 2]), Ed, cl_d, sat_d, nm_d, rec_d,
+             f"Sintela channel {int(res['ch'])}, strain rate from {L.get('unit_kind')} ({res['fs_d']:g} Hz, GL {gl} m, dx {L['dx']:g} m)",
+             "dB re 1 (n\u03b5/s)\u00b2/Hz"),
+            (ax4, fig.add_subplot(gs[3, 2]), Es, cl_s, sat_s, nm_s, rec_s,
+             f"seismometer {sid}, ground velocity from StationXML ({res['fs_s']:g} Hz)", "dB re 1 (\u00b5m/s)\u00b2/Hz")):
+        im = ax.pcolormesh(te, fe, np.ma.masked_invalid(E.T), cmap=cmap, norm=nm, shading="flat",
+                           rasterized=True)
+
+
+        trans = matplotlib.transforms.blended_transform_factory(ax.transData, ax.transAxes)
+        for row, col in ((0, "orange"), (1, "red")):
+            m = rec[row] > 0
+            if m.any():
+                ax.plot(tmid[m], np.full(m.sum(), 0.995), "|", color=col, ms=5, mew=1.0, transform=trans,
+                        clip_on=False, zorder=5)
+        n_rep, n_msk = int(np.sum(rec[0] > 0)), int(np.sum(rec[1] > 0))
+        rtxt = (f"  "
+                if (n_rep or n_msk) else " ")
+        ax.set_yscale("log")
+        ax.set_ylim(fe[0], fe[-1])
+        ax.set_ylabel("frequency [Hz]")
+        if have_band:
+            for fb in band:
+                ax.axhline(fb, color="cyan", lw=0.8, ls=":")
+        ax.text(0.005, 0.97, f"{txt}  |  colour [{cl[0]:.3g}, {cl[1]:.3g}] {SPEC_COLOR_SCALE if SPEC_DISPLAY != 'absolute' else 'linear'}, "
+                f"{sat:.2f}% outside{rtxt}", transform=ax.transAxes,
+                fontsize=FONT_ANNOTATION, va="top", color="white", bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5, lw=0))
+        cb = fig.colorbar(im, cax=cax)
+        if SPEC_COLOR_SCALE == "asinh" and SPEC_DISPLAY != "absolute":
+
+            cand = np.array([-100, -50, -20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000], float)
+            tk = cand[(cand >= cl[0]) & (cand <= cl[1])]
+            cb.set_ticks(tk)
+            cb.set_ticklabels([f"{v:g}" for v in tk])
+            cb.minorticks_off()
+        cb.set_label(labs.get(SPEC_DISPLAY, lab_abs), fontsize=FONT_COLORBAR_LABEL)
+        cb.ax.tick_params(labelsize=FONT_COLORBAR_TICKS)
+    if fny_s < fe[-1]:
+        ax4.axhspan(fny_s, fe[-1], color="0.75", zorder=3)
+        ax4.text(0.5, 0.985, f"above the seismometer Nyquist frequency ({fny_s:g} Hz)", transform=ax4.transAxes,
+                 ha="center", va="top", fontsize=FONT_ANNOTATION, color="0.2", zorder=4)
+    tn = mdates.date2num([from_posix(x) for x in et])
+    btxt = f"{band[0]:.2g}-{band[1]:.3g} Hz" if have_band else "no band"
+    for ax, rr, col, name, unit in ((ax2, ed, "tab:red", "DAS", "estimated axial velocity from strain rate x C(f)"),
+                                    (ax3, es, "tab:blue", "seismometer", "velocity")):
+        ax.plot(tn, rr, color=col, lw=0.5)
+        ok = np.isfinite(rr) & (rr > 0)
+        if ok.any():
+            ax.set_yscale("log")
+            lo, hi = np.percentile(rr[ok], 0.1), rr[ok].max()
+            ax.set_ylim(10 ** np.floor(np.log10(lo) - 0.05), 10 ** np.ceil(np.log10(hi) + 0.05))
+        ax.set_ylabel(name)
+        ax.grid(True, which="major", ls="--", alpha=0.3)
+        ax.text(0.005, 0.95, f"RMS {unit}, {btxt} (band where C(f) was measured) [\u00b5m/s], {RMS_STEP_SEC:g} s steps",
+                transform=ax.transAxes, fontsize=FONT_ANNOTATION, va="top", color="0.3")
+    if not have_band:
+        ax2.text(0.5, 0.5, "C(f) could not be measured reliably: no conversion of DAS to velocity (no assumption made)",
+                 transform=ax2.transAxes, ha="center", fontsize=FONT_ANNOTATION, color="darkred")
+    elif np.isfinite(ratio):
+        ax2.text(0.995, 0.95, f"median projected DAS / seismometer RMS = {ratio:.2f}", transform=ax2.transAxes, fontsize=FONT_ANNOTATION,
+                 va="top", ha="right", color="0.2", bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8, lw=0))
+    for ax in (ax1, ax2, ax3):
+        plt.setp(ax.get_xticklabels(), visible=False)
+    ax4.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M" if tb - ta <= 2 * 86400 else "%m-%d %H:%M"))
+    ax4.set_xlim(mdates.date2num(from_posix(ta)), mdates.date2num(from_posix(tb)))
+    if have_band:
+        ax5.plot(lag_s, r, color="tab:green", lw=1.0)
+        if np.isfinite(r_sig):
+            ax5.axhline(r_sig, color="0.5", lw=0.8, ls="--")
+            ax5.axhline(-r_sig, color="0.5", lw=0.8, ls="--")
+        if np.isfinite(lag_best):
+            ax5.axvline(lag_best, color="black", lw=0.8, ls="--")
+    ax5.axvline(0, color="black", lw=0.8)
+    ax5.set_xlim(-LAG_MAX_SEC, LAG_MAX_SEC)
+    ax5.set_xlabel("lag of DAS relative to seismometer [s] (positive = DAS late)")
+    ax5.set_ylabel("corr.")
+    ax5.grid(True, ls="--", alpha=0.3)
+    if not np.isfinite(rmax):
+        msg = "envelope cross-correlation: not available"
+    elif rmax < 0.4:
+        msg = (f"whole-record envelope association is weak (r={rmax:.2f}); "
+               "inspect event windows before assessing timestamps")
+    else:
+        msg = (f"envelope similarity peak r={rmax:.2f}, lag={lag_best:+.1f} s (5-s RMS sampling) "
+              )
+    ax5.text(0.005, 0.95, msg, transform=ax5.transAxes, fontsize=FONT_ANNOTATION, va="top",
+             bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8, lw=0))
+    ax1.set_title(f"DAS vs seismometer, {CELL_SEC:g} s UTC grid  |  {from_posix(ta):%Y-%m-%d %H:%M} to {from_posix(tb):%Y-%m-%d %H:%M} UTC\n"
+                  f"{fe[0]:.2g}-{fe[-1]:.4g} Hz  |  tiers " +
+                  ", ".join(f"{a_:g}-{(b_ if b_ else fe[-1]):.3g} Hz: {s_:g} s" for a_, b_, s_, _ in TIERS) +
+                  f"\n  |  colour {SPEC_DISPLAY}, per panel  |  dotted cyan: RMS band ", fontsize=FONT_MAIN_TITLE)
+    path = next_path(f"DAS_seismic_velocity_{CABLE}_{WINDOW_NAME}_Ch{int(res['ch'])}_Pos{SELECTED_DIST_M:.0f}m", "jpeg")
+    fig.savefig(path, format="jpeg", dpi=DPI_SAVE, bbox_inches="tight",
+                pil_kwargs={"quality": int(min(95, max(1, JPEG_QUALITY))), "optimize": True})
+    plt.close(fig)
+    stem = os.path.splitext(path)[0]
+    np.savetxt(stem + ".csv", np.column_stack([et, ed, es]), delimiter=",", fmt="%.6g",
+               header="DAS_projected_axial_velocity_rms_um_s,seis_component_velocity_rms_um_s", comments="")
+    np.savetxt(stem + "_C.csv", np.column_stack([C["f"], C["c"], C["lo"], C["hi"], C["c_fill"]]), delimiter=",",
+               fmt="%.6g", header="frequency_Hz,C_measured_m_s,C_low_m_s,C_high_m_s,C_used_m_s", comments="")
+    coverage_path = stem + "_coverage.csv"
+    tcoord = np.asarray(res["t"], dtype=np.float64)
+    diag = np.column_stack([tcoord, res["cov_d"], res["cov_s"],
+                            np.asarray(res["tier_cov_d"], dtype=float).T,
+                            np.asarray(res["tier_cov_s"], dtype=float).T,
+                            np.asarray(rec_d, dtype=float).T, np.asarray(rec_s, dtype=float).T])
+    names = ["utc_epoch_s", "DAS_fraction", "Seis_fraction"] + [f"DAS_tier{i+1}_valid" for i in range(res["tier_cov_d"].shape[0])] + [f"Seis_tier{i+1}_valid" for i in range(res["tier_cov_s"].shape[0])] \
+        + ["DAS_spike_bridged_frac", "DAS_clipped_masked_frac", "Seis_spike_bridged_frac", "Seis_clipped_masked_frac"]
+    np.savetxt(coverage_path, diag, fmt="%.6g", delimiter=",", header=",".join(names), comments="")
+    for title, cov, tier_cov in (("DAS", res["cov_d"], res["tier_cov_d"]), ("seismometer", res["cov_s"], res["tier_cov_s"])):
+        log(f"  {title}: valid raw core cells {np.mean(cov >= MIN_COVERAGE)*100:.1f}% ; spectral tier availability " +
+            ", ".join(f"{v*100:.0f}%" for v in np.mean(tier_cov, axis=1)))
+    for title, rec, sat, cl in (("DAS", rec_d, sat_d, cl_d), ("seismometer", rec_s, sat_s, cl_s)):
+        log(f"  {title}: colour [{cl[0]:.3g}, {cl[1]:.3g}] with {sat:.2f}% of cells outside; recording saturation in "
+            f"{np.mean(rec[1] > 0)*100:.1f}% of cells (clipped, masked) and {np.mean(rec[0] > 0)*100:.1f}% (spikes, bridged)")
+    log(f"  RMS band {btxt}; median DAS / seismometer RMS: {ratio:.2f} (projected axial vs seismometer component, not instrument calibration)")
+    log(f"  envelope cross-correlation: r = {rmax:.2f} at {lag_best:+.1f} s, significance level {r_sig:.2f}")
+    log(f"  saved: {path}  (+ .csv, _C.csv)")
+
+
+def main():
+    global _rebuild, SELECTED_DIST_M
+    ap = argparse.ArgumentParser(description="Sintela DAS vs seismometer spectrogram with C(f) measured from the DAS array")
+    ap.add_argument("--start")
+    ap.add_argument("--end")
+    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--inspect", metavar="FILE", help="print the HDF5 structure and the values this script reads, then stop")
+    a, _ = ap.parse_known_args()
+    _rebuild = bool(a.rebuild)
+    if a.inspect:
+        inspect_file(a.inspect)
+        L = file_info(a.inspect)
+        log("\nvalues used by this script:")
+        for k in ("dataset", "time_axis", "n_t", "n_ch", "fs", "fs_src", "pulse_rate", "dx", "dx_src", "gauge_m",
+                  "gauge_src", "unit_kind", "unit_src", "raw_scale", "raw_scale_src", "start_locus", "time_dataset"):
+            log(f"  {k:14s} {L.get(k)}")
+        return
+    check_settings()
+    t_start = parse_window_time(a.start or START_TIME)
+    t_end = parse_window_time(a.end or END_TIME)
+    if t_end <= t_start:
+        raise StopRun("END_TIME is before START_TIME")
+    ta, tb = to_posix(t_start), to_posix(t_end)
+    log(f"\n{t_start:%Y-%m-%d %H:%M:%S} -> {t_end:%Y-%m-%d %H:%M:%S} UTC")
+    stamped, file_sec = list_files(DATA_FOLDER, RECURSIVE)
+    if DATA_FILES:
+        names = {os.path.basename(n) for n in DATA_FILES}
+        stamped = [r for r in stamped if os.path.basename(r[0]) in names]
+    check_window(stamped, file_sec, ta, tb)
+    sel = [r for r in stamped if to_posix(r[1]) < tb and to_posix(r[1]) + file_sec > ta]
+    if not sel:
+        raise StopRun("no DAS files in the window")
+    L = layout_of(sel[0][0])
+    if SELECTED_CHANNEL is not None:
+        if not 0 <= int(SELECTED_CHANNEL) < L["n_ch"]:
+            raise StopRun(f"SELECTED_CHANNEL {SELECTED_CHANNEL} is outside 0..{L['n_ch'] - 1}")
+        SELECTED_DIST_M = x0_of(L) + int(SELECTED_CHANNEL) * L["dx"]
+    jsel = int(round((SELECTED_DIST_M - x0_of(L)) / L["dx"]))
+    if not 0 <= jsel < L["n_ch"]:
+        raise StopRun(f"SELECTED_DIST_M {SELECTED_DIST_M:g} m is channel {jsel}, outside 0..{L['n_ch'] - 1} "
+                      f"(dx {L['dx']:g} m)")
+    dur = L["n_t"] / L["fs"]
+    log(f"  Sintela data: {L['dataset']} {'(time, channel)' if L['time_axis'] == 0 else '(channel, time)'}, "
+        f"{L['n_ch']} channels, {L['n_t']} samples = {dur:.1f} s per file; unit {L['unit_kind']} ({L['unit_src']}), "
+        f"scale {L['raw_scale']:g} ({L['raw_scale_src']}), pulse rate {L.get('pulse_rate')}")
+    if L.get("start_locus") is not None:
+        log(f"  (StartLocusIndex = {L['start_locus']:g}; positions here count from channel 0 of RawData)")
+    if dur > 1.1 * file_sec:
+        raise StopRun(f"{L['n_t']} samples at {L['fs']:g} Hz last {dur:.1f} s but files start every {file_sec:.1f} s: "
+                      f"the sampling rate ({L['fs_src']}) is wrong. Set SAMPLING_RATE_HZ (about {L['n_t'] / file_sec:.6g} Hz?)")
+    if dur < 0.9 * file_sec:
+        log(f"  ! files hold {dur:.1f} s but start every {file_sec:.1f} s: gaps between files, or check the sampling rate "
+            f"({L['fs_src']})")
+    log(f"  DAS metadata: fs {L['fs']:g} Hz ({L['fs_src']}), dx {L['dx']:g} m ({L['dx_src']}), GL {L.get('gauge_m')} m "
+        f"({L.get('gauge_src')}), channel 0 at {x0_of(L):g} m ({L.get('x0_src')}); {SELECTED_DIST_M:g} m = channel "
+        f"{int(round((SELECTED_DIST_M - x0_of(L)) / L['dx']))}")
+    paths, _ = convert_seismic()
+    index = seis_index(paths)
+    sid, fs_s = choose_seis_id(index, ta, tb)
+    inv = load_inventory()
+    log(f"  seismometer: {sid} ({fs_s:g} Hz from the data headers), response from {len(response_files())} StationXML file(s)")
+    log("\n  measuring the apparent velocity C(f) along the fibre")
+    C = measure_c(stamped, file_sec, ta, tb, L)
+    if np.isfinite(C["band"]).all():
+        cu = C["c_fill"][np.isfinite(C["c_fill"])]
+        log(f"  C(f) measured over {C['band'][0]:.2f}-{C['band'][1]:.1f} Hz: {cu.max():.0f} -> {cu.min():.0f} m/s "
+            f"({int(C['ok'].sum())} reliable frequencies)")
+    else:
+        log("  ! C(f) could not be measured reliably: DAS is shown in strain rate only, no velocity conversion")
+    res = compute(stamped, file_sec, ta, tb, L, index, sid, fs_s, inv, C)
+    ok_d = np.mean(np.isfinite(res["S_d"]).any(axis=1))
+    ok_s = np.mean(np.isfinite(res["S_s"]).any(axis=1))
+    log(f"  cells with any spectral data: DAS {100 * ok_d:.0f} %, seismometer {100 * ok_s:.0f} %")
+    if np.mean(res["tier_cov_d"][0]) < 0.80:
+        log("  ! Low-frequency DAS tier has limited usable uninterrupted data. Its grey regions are genuine unresolved bins; see _coverage.csv.")
+    plot(res, C, L, sid, ta, tb)
+    log("\nDone.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except StopRun as stop:
+        print(f"\nSTOPPED: {stop}")
