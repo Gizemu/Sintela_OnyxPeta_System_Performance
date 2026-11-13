@@ -1,0 +1,326 @@
+
+import os
+import h5py
+import re
+import numpy as np
+import datetime
+import matplotlib
+matplotlib.use('Agg')
+matplotlib.rcParams['agg.path.chunksize'] = 10000
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.signal import butter, filtfilt
+
+
+folder           = "/Volumes/X9 Pro/1-Sintela_July2025/Sintela July 18"
+save_folder      = os.path.join(folder, "output_spectrogram_phase_rms")
+
+selected_files   = []
+selected_channel = 149
+
+freq_min         = 1.0        
+freq_max         = 50.0        
+
+
+NFFT             = 4096
+noverlap         = 3584
+cmap_spec        = 'inferno'
+
+
+signal_ylim      = 0.05   
+rms_ylim         = 0.025   
+
+
+rms_window_sec   = 0.4         
+rms_skip_thresh  = 1.0         
+
+
+PLOT_DECIMATE    = 10          
+                               
+
+
+fig_width        = 18
+fig_height       = 12
+dpi_save         = 640         
+
+
+
+def load_sintela_hdf5(file_path):
+    with h5py.File(file_path, 'r') as f:
+        data = None
+        for path in ['/Acquisition/Raw[0]/RawData', '/RawData', 'RawData']:
+            try:
+                data = f[path][:]
+                break
+            except KeyError:
+                continue
+        if data is None:
+            raise ValueError(f"Could not find data in {file_path}")
+        metadata = {}
+        f.visititems(lambda name, obj: metadata.update(
+            {f"{name}/{k}": v for k, v in obj.attrs.items()} if hasattr(obj, 'attrs') else {}))
+        metadata.update(dict(f.attrs))
+
+    params = {'sampling_rate': 1000.0, 'gauge_length': 10.0,
+              'n_samples': data.shape[0], 'n_channels': data.shape[1]}
+    for k in ['PulseRate', 'SamplingRate', 'Acquisition/PulseRate', 'Acquisition/SamplingRate']:
+        if k in metadata:
+            params['sampling_rate'] = float(metadata[k])
+            break
+    for k in ['GaugeLength', 'GageLength', 'Acquisition/GaugeLength', 'Acquisition/GageLength']:
+        if k in metadata:
+            params['gauge_length'] = float(metadata[k])
+            break
+    return data, params
+
+
+def parse_time_from_filename(filename):
+    match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}\.\d{2}\.\d{2})_UTC", filename)
+    if match:
+        date_str, time_str = match.groups()
+        return datetime.datetime.strptime(f"{date_str}_{time_str}", "%Y-%m-%d_%H.%M.%S")
+    return None
+
+
+def bandpass_filter(signal, fs, f_low, f_high, order=4):
+    nyq  = fs / 2.0
+    low  = f_low / nyq
+    high = min(f_high / nyq, 0.99)
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, signal)
+
+
+def compute_rms(signal, fs, window_sec):
+    window_samples = int(window_sec * fs)
+    n_windows      = len(signal) // window_samples
+    rms_values     = np.zeros(n_windows)
+    for i in range(n_windows):
+        chunk         = signal[i * window_samples:(i + 1) * window_samples]
+        rms_values[i] = np.sqrt(np.mean(chunk ** 2))
+    return rms_values
+
+
+def collect_data(folder, h5_files, selected_channel):
+    first_data, first_params = load_sintela_hdf5(os.path.join(folder, h5_files[0]))
+    gauge_length = first_params['gauge_length']
+    n_channels   = first_params['n_channels']
+
+    if not (0 <= selected_channel < n_channels):
+        raise ValueError(f"Invalid channel. Must be 0-{n_channels - 1}.")
+
+    raw_signal      = []
+    filtered_signal = []
+    times_signal    = []
+    rms_values_all  = []
+    times_rms       = []
+    t_start         = None
+    fs              = None
+
+    for file_name in h5_files:
+        file_time = parse_time_from_filename(file_name)
+        if file_time is None:
+            file_time = datetime.datetime.utcnow()
+
+        try:
+            data, params = load_sintela_hdf5(os.path.join(folder, file_name))
+        except Exception as e:
+            print(f"Skipping {file_name}: {e}")
+            continue
+
+        if selected_channel >= params['n_channels']:
+            print(f"Skipping {file_name}: channel {selected_channel} not available.")
+            continue
+
+        fs_file = params['sampling_rate']
+        phase   = data[:, selected_channel].astype(np.float64)
+
+        raw_signal.extend(phase.tolist())
+
+        filtered = bandpass_filter(phase, fs_file, freq_min, freq_max)
+        n_samp   = len(filtered)
+        t_sec    = np.arange(n_samp) / fs_file
+        times_signal.extend(
+            [file_time + datetime.timedelta(seconds=float(t)) for t in t_sec])
+        filtered_signal.extend(filtered.tolist())
+
+        rms     = compute_rms(filtered, fs_file, rms_window_sec)
+        max_rms = float(np.max(rms))
+        if max_rms > rms_skip_thresh:
+            print(f"  note: {file_name} max RMS = {max_rms:.4f} rad — clipped at y-limit")
+
+        n_win = len(rms)
+        times_rms.extend(
+            [file_time + datetime.timedelta(seconds=i * rms_window_sec)
+             for i in range(n_win)])
+        rms_values_all.extend(rms.tolist())
+
+        if t_start is None:
+            t_start = file_time
+            fs      = fs_file
+
+        print(f"Loaded: {file_name}  |  fs={fs_file:.0f} Hz  |  GL={params['gauge_length']} m")
+
+    return (t_start, fs, gauge_length,
+            np.array(raw_signal),
+            np.array(filtered_signal), times_signal,
+            np.array(rms_values_all),  times_rms)
+
+
+def main():
+    os.makedirs(save_folder, exist_ok=True)
+
+    if selected_files:
+        h5_files = [f for f in selected_files
+                    if os.path.isfile(os.path.join(folder, f))]
+        for m in [f for f in selected_files
+                  if not os.path.isfile(os.path.join(folder, f))]:
+            print(f"File not found: {m}")
+    else:
+        h5_files = sorted([f for f in os.listdir(folder) if f.endswith('.h5')])
+
+    if not h5_files:
+        print("No H5 files found.")
+        return
+
+    (t_start, fs, gauge_length,
+     raw_signal,
+     filtered_signal, times_signal,
+     rms_arr, times_rms) = collect_data(folder, h5_files, selected_channel)
+
+    if t_start is None:
+        print("No data collected.")
+        return
+
+    optical_pos = selected_channel * gauge_length
+    t_end       = times_signal[-1] if times_signal else times_rms[-1]
+
+    signal_plot = np.array(filtered_signal)
+    rms_plot    = rms_arr
+
+    
+    t_signal_sec = np.array([(t - t_start).total_seconds() for t in times_signal])
+    t_rms_sec    = np.array([(t - t_start).total_seconds() for t in times_rms])
+    total_sec    = (t_end - t_start).total_seconds()
+
+    
+    sl = slice(None, None, PLOT_DECIMATE)
+    t_sig_plot = t_signal_sec[sl]
+    sig_plot   = signal_plot[sl]
+    t_rms_plot = t_rms_sec       
+    rms_plot_d = rms_plot
+
+    print(f"\nPlot points  — Phase: {len(sig_plot):,}  |  RMS: {len(rms_plot_d):,}")
+
+    def sec_to_hhmm(sec, _):
+        return (t_start + datetime.timedelta(seconds=float(sec))).strftime('%H:%M')
+
+    
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    gs  = gridspec.GridSpec(
+        3, 2,
+        width_ratios  = [1, 0.02],
+        height_ratios = [2.5, 1, 1],
+        hspace        = 0.06,
+        wspace        = 0.03,
+    )
+
+    ax_spec   = fig.add_subplot(gs[0, 0])
+    ax_cbar   = fig.add_subplot(gs[0, 1])
+    ax_signal = fig.add_subplot(gs[1, 0], sharex=ax_spec)
+    ax_rms    = fig.add_subplot(gs[2, 0], sharex=ax_spec)
+
+    ax_blank1 = fig.add_subplot(gs[1, 1])
+    ax_blank2 = fig.add_subplot(gs[2, 1])
+    ax_blank1.set_visible(False)
+    ax_blank2.set_visible(False)
+
+    
+    Pxx, freqs, t_bins, im = ax_spec.specgram(
+        raw_signal,
+        NFFT     = NFFT,
+        Fs       = fs,
+        noverlap = noverlap,
+        cmap     = cmap_spec,
+        scale    = 'dB',
+        mode     = 'psd',
+        sides    = 'onesided',
+    )
+
+    freq_mask = (freqs >= freq_min) & (freqs <= freq_max)
+    Pxx_db    = 10 * np.log10(Pxx[freq_mask, :] + 1e-20)
+    im.set_clim(float(np.percentile(Pxx_db, 5)),
+                float(np.percentile(Pxx_db, 95)))
+
+    ax_spec.set_ylim(freq_min, freq_max)
+    ax_spec.set_ylabel('Frequency (Hz)', fontsize=10)
+    ax_spec.xaxis.set_major_formatter(plt.FuncFormatter(sec_to_hhmm))
+    ax_spec.grid(False)
+    plt.setp(ax_spec.xaxis.get_majorticklabels(), visible=False)
+
+    plt.colorbar(im, cax=ax_cbar)
+    ax_cbar.set_ylabel('PSD (dB re 1 rad\u00b2/Hz)', fontsize=9)
+
+    ax_spec.set_title(
+        f"Channel {selected_channel}  (Optical Position: {optical_pos:.1f} m)  |  "
+        f"{freq_min:.0f}\u2013{freq_max:.0f} Hz  |  GL = {gauge_length:.1f} m\n"
+        f"{t_start.strftime('%Y-%m-%d %H:%M:%S UTC')} to "
+        f"{t_end.strftime('%H:%M:%S UTC')}",
+        fontsize=10, pad=6,
+    )
+
+    
+    ax_signal.plot(t_sig_plot, sig_plot,
+                   linewidth=0.3, color='steelblue', alpha=0.9, clip_on=True,
+                   rasterized=True)
+    ax_signal.set_ylabel('Phase (rad)', fontsize=10)
+    ax_signal.set_xlim(0, total_sec)
+    ax_signal.set_ylim(-signal_ylim, signal_ylim)
+    ax_signal.axhline(0, color='gray', linewidth=0.4, linestyle='--', alpha=0.5)
+    ax_signal.grid(True, ls='--', alpha=0.25)
+    ax_signal.xaxis.set_major_formatter(plt.FuncFormatter(sec_to_hhmm))
+    plt.setp(ax_signal.xaxis.get_majorticklabels(), visible=False)
+
+    
+    ax_rms.plot(t_rms_plot, rms_plot_d,
+                linewidth=0.8, color='darkorange', alpha=0.9, clip_on=True,
+                rasterized=True)
+    ax_rms.set_ylabel('RMS Phase (rad)', fontsize=10)
+    ax_rms.set_xlabel('Time (UTC)', fontsize=10)
+    ax_rms.set_xlim(0, total_sec)
+    ax_rms.set_ylim(0, rms_ylim)
+    ax_rms.grid(True, ls='--', alpha=0.25)
+    ax_rms.xaxis.set_major_formatter(plt.FuncFormatter(sec_to_hhmm))
+    plt.setp(ax_rms.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    ax_rms.annotate(
+        f'window = {rms_window_sec} s  |  phase y-limit = ±{signal_ylim} rad  |  '
+        f'RMS y-limit = {rms_ylim} rad',
+        xy=(0.01, 0.92), xycoords='axes fraction',
+        fontsize=8, color='gray',
+    )
+
+    
+    for ax, label in [(ax_spec,   'Spectrogram'),
+                      (ax_signal, 'Phase'),
+                      (ax_rms,    'RMS')]:
+        ax.annotate(
+            label,
+            xy=(-0.055, 0.5), xycoords='axes fraction',
+            fontsize=9, fontweight='bold', color='dimgray',
+            ha='center', va='center', rotation=90,
+        )
+
+    plt.tight_layout()
+
+    save_path = os.path.join(
+        save_folder,
+        f'Combined_Ch{selected_channel}_Pos{optical_pos:.0f}m_'
+        f'{freq_min:.0f}-{freq_max:.0f}Hz.jpeg',
+    )
+    plt.savefig(save_path, format='jpeg', dpi=dpi_save, bbox_inches='tight')
+    plt.close()
+    print(f"\nSaved: {save_path}")
+
+
+if __name__ == "__main__":
+    main()
