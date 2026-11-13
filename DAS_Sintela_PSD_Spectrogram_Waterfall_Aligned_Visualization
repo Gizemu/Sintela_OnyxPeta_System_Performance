@@ -1,0 +1,588 @@
+#Author: Gizem Karslioglu
+import os
+import gc
+import re
+import glob
+import h5py
+import numpy as np
+import datetime
+import traceback
+import matplotlib
+import matplotlib
+matplotlib.use('Agg')
+matplotlib.rcParams['agg.path.chunksize'] = 10000
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import Normalize
+from scipy.signal import butter, sosfiltfilt, spectrogram as sp_spectrogram
+
+# USER SETTINGS
+
+H5_FOLDER    = r"/Volumes/X9 Pro/1-Sintela_July2025/Sintela July 18"
+CACHE_FOLDER = os.path.join(H5_FOLDER, "cache")
+SAVE_FOLDER  = os.path.join(H5_FOLDER, "Combined4Panel")
+
+# Set True to rebuild all cache files from scratch
+FORCE_REBUILD_CACHE = False
+
+# Crop to a time window; None = use all files
+TIME_START = "2025-07-18 17:00:00"   # e.g. "2025-06-12 09:00:00"
+TIME_END   = "2025-07-18 18:30:00"   # e.g. "2025-06-12 10:00:00"
+
+# One figure is produced per channel
+SELECTED_CHANNELS = [120, 149, 192, 197]
+
+# Channel range stored in cache (None = all)
+CACHE_CH_START = 0
+CACHE_CH_END   = None
+
+# Channel range shown on the waterfall y-axis (None = all cached)
+PLOT_CH_START = 1
+PLOT_CH_END   = None
+
+FREQ_MIN = 10.0
+FREQ_MAX = 50.0
+
+# Waterfall: keep every Nth sample after bandpass (plain stride, no FIR rounding)
+WF_STRIDE = 5
+
+# Applied to all filename timestamps
+TIME_OFFSET_SECONDS = 0
+
+SPEC_NFFT     = 9000     
+SPEC_NOVERLAP = 8000
+SPEC_CMAP     = "inferno"
+
+WF_CMAP       = "RdBu_r"
+WF_VMAX       = 0.025
+WF_MAD_MULT   = 15.0
+WF_SPIKE_CLIP = 5.0
+MAX_WF_ROWS   = 10000
+
+PHASE_YLIM     = 0.1
+RMS_WINDOW_SEC = 0.2
+RMS_YLIM       = 0.05
+
+DPI_SAVE  = 1280
+FIG_WIDTH = 22
+
+# END OF USER SETTINGS
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def parse_time_from_filename(filename):
+    m = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}\.\d{2}\.\d{2})_UTC", filename)
+    if m:
+        d, t = m.groups()
+        return (datetime.datetime.strptime(f"{d}_{t}", "%Y-%m-%d_%H.%M.%S")
+                + datetime.timedelta(seconds=TIME_OFFSET_SECONDS))
+    return None
+
+
+def load_h5(file_path):
+    with h5py.File(file_path, "r") as f:
+        data = None
+        for path in ["/Acquisition/Raw[0]/RawData", "/RawData", "RawData"]:
+            try:
+                data = f[path][:]
+                break
+            except KeyError:
+                continue
+        if data is None:
+            raise ValueError(f"No raw data found in {file_path}")
+        meta = {}
+        f.visititems(lambda name, obj: meta.update(
+            {f"{name}/{k}": v for k, v in obj.attrs.items()}
+            if hasattr(obj, "attrs") else {}))
+        meta.update(dict(f.attrs))
+
+    params = {"sampling_rate": 1000.0, "gauge_length": 10.0,
+              "n_samples": data.shape[0], "n_channels": data.shape[1]}
+    for k in ["PulseRate", "SamplingRate",
+              "Acquisition/PulseRate", "Acquisition/SamplingRate"]:
+        if k in meta:
+            params["sampling_rate"] = float(meta[k])
+            break
+    for k in ["GaugeLength", "GageLength",
+              "Acquisition/GaugeLength", "Acquisition/GageLength"]:
+        if k in meta:
+            params["gauge_length"] = float(meta[k])
+            break
+    return data, params
+
+
+def make_sos(fs, f_low, f_high, order=4):
+    nyq = fs / 2.0
+    return butter(order, [f_low / nyq, min(f_high / nyq, 0.99)],
+                  btype="bandpass", output="sos")
+
+
+def compute_rms(signal, fs, window_sec):
+    n = int(window_sec * fs)
+    k = len(signal) // n
+    out = np.zeros(k)
+    for i in range(k):
+        out[i] = np.sqrt(np.mean(signal[i * n:(i + 1) * n] ** 2))
+    return out
+
+
+def hhmm(t0, sec):
+    return (t0 + datetime.timedelta(seconds=float(sec))).strftime("%H:%M")
+
+
+def time_fmt(t0):
+    return lambda sec, _: hhmm(t0, sec)
+
+
+# cache build
+
+# Cache filename encodes parameters so stale caches are not reused after settings change
+def cache_filename(h5_name):
+    base = os.path.splitext(h5_name)[0]
+    tag  = f"raw_ch{CACHE_CH_START}_{CACHE_CH_END or 'all'}_toff{TIME_OFFSET_SECONDS:+d}"
+    return f"{base}__{tag}.npz"
+
+
+def build_one_cache(h5_path, npz_path):
+    data, params = load_h5(h5_path)
+    fs   = params["sampling_rate"]
+    gl   = params["gauge_length"]
+    n_ch = params["n_channels"]
+    ch_s = max(0, CACHE_CH_START)
+    ch_e = min(n_ch, CACHE_CH_END) if CACHE_CH_END is not None else n_ch
+
+    file_time = parse_time_from_filename(os.path.basename(h5_path))
+    if file_time is None:
+        file_time = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    t0_ns = int(np.datetime64(file_time.isoformat(), "ns").astype(np.int64))
+
+    np.savez_compressed(
+        npz_path,
+        raw_full     = data.astype(np.float32),
+        t0_ns        = np.int64(t0_ns),
+        fs_orig      = np.float64(fs),
+        gauge_length = np.float64(gl),
+        n_ch_total   = np.int64(n_ch),
+        ch_start     = np.int64(ch_s),
+        ch_end       = np.int64(ch_e),
+        schema_ver   = np.int64(2),   # version tag so old caches are ignored
+    )
+    del data
+    gc.collect()
+
+
+def build_cache(h5_folder, cache_folder):
+    os.makedirs(cache_folder, exist_ok=True)
+    h5_files = sorted([f for f in os.listdir(h5_folder) if f.endswith(".h5")])
+    if not h5_files:
+        raise FileNotFoundError(f"No .h5 files in {h5_folder}")
+
+    log(f"\nBuilding cache  ({len(h5_files)} files)")
+    log(f"  Source : {h5_folder}")
+    log(f"  Cache  : {cache_folder}")
+    log(f"  Rebuild: {FORCE_REBUILD_CACHE}")
+
+    for i, fn in enumerate(h5_files, 1):
+        npz_path = os.path.join(cache_folder, cache_filename(fn))
+        if os.path.exists(npz_path) and not FORCE_REBUILD_CACHE:
+            log(f"  [{i:3d}/{len(h5_files)}] exists : {fn}")
+            continue
+        try:
+            build_one_cache(os.path.join(h5_folder, fn), npz_path)
+            log(f"  [{i:3d}/{len(h5_files)}] cached : {fn}"
+                f"  ({os.path.getsize(npz_path)/1e6:.1f} MB)")
+        except Exception as e:
+            log(f"  [{i:3d}/{len(h5_files)}] FAILED : {fn}  -> {e}")
+    log("Cache complete.\n")
+
+
+# cache selection
+
+def t0_from_npz(npz):
+    t0_ns = int(npz["t0_ns"])
+    return datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=t0_ns / 1e9)
+
+
+def dur_from_npz(npz):
+    return int(npz["raw_full"].shape[0]) / float(npz["fs_orig"])
+
+
+def is_valid_cache(p):
+    """Return True only for cache files created by this script (schema_ver == 2)."""
+    try:
+        npz = np.load(p, mmap_mode="r")
+        # must have schema_ver key and raw_full (not wf_data from old format)
+        return ("schema_ver" in npz and int(npz["schema_ver"]) == 2
+                and "raw_full" in npz)
+    except Exception:
+        return False
+
+
+def select_cache_files(cache_folder, t_start, t_end):
+    selected = []
+    all_npz = sorted(glob.glob(os.path.join(cache_folder, "*.npz")))
+    skipped = 0
+    for p in all_npz:
+        if not is_valid_cache(p):
+            skipped += 1
+            continue
+        try:
+            npz = np.load(p, mmap_mode="r")
+            ct0 = t0_from_npz(npz)
+            ct1 = ct0 + datetime.timedelta(seconds=dur_from_npz(npz))
+            if t_start is not None and ct1 <= t_start:
+                continue
+            if t_end   is not None and ct0 >= t_end:
+                continue
+            selected.append((p, ct0, ct1))
+        except Exception as e:
+            log(f"  Warning: {os.path.basename(p)}: {e}")
+    if skipped:
+        log(f"  Skipped {skipped} old-format cache file(s) — run with FORCE_REBUILD_CACHE=True to update them.")
+    return sorted(selected, key=lambda x: x[1])
+
+
+# data loading
+
+def load_window(entries, t_start_clip, t_end_clip, sel_ch, plot_ch_s, plot_ch_e):
+    """
+    Load raw (unfiltered) samples for the requested time window.
+    raw_1ch and raw_wf come from the SAME s0:s1 slice of raw_full,
+    so len(raw_1ch) == raw_wf.shape[0] is guaranteed.
+    """
+    blocks_1ch = []
+    blocks_wf  = []
+    global_t0  = None
+    fs_orig = gauge_length = cache_ch_start = n_ch_total = None
+
+    for p, ct0, ct1 in entries:
+        npz      = np.load(p, mmap_mode="r")
+        fso      = float(npz["fs_orig"])
+        gl       = float(npz["gauge_length"])
+        cch_s    = int(npz["ch_start"])
+        cch_e    = int(npz["ch_end"])
+        n_ch_tot = int(npz["n_ch_total"])
+        N        = int(npz["raw_full"].shape[0])
+
+        clip_s = max(t_start_clip if t_start_clip is not None else ct0, ct0)
+        clip_e = min(t_end_clip   if t_end_clip   is not None else ct1, ct1)
+        if clip_s >= clip_e:
+            continue
+
+        # Use round() for consistent integer conversion on both boundaries
+        s0 = max(0, round((clip_s - ct0).total_seconds() * fso))
+        s1 = min(N, round((clip_e - ct0).total_seconds() * fso))
+        if s1 <= s0:
+            continue
+
+        if global_t0 is None:
+            global_t0      = ct0 + datetime.timedelta(seconds=s0 / fso)
+            fs_orig        = fso
+            gauge_length   = gl
+            cache_ch_start = cch_s
+            n_ch_total     = n_ch_tot
+
+        raw = npz["raw_full"][s0:s1, :]
+
+        if 0 <= sel_ch < n_ch_tot:
+            blocks_1ch.append(raw[:, sel_ch].astype(np.float64).copy())
+
+        local_s = max(0, plot_ch_s - cch_s)
+        local_e = (min(cch_e, plot_ch_e) - cch_s
+                   if plot_ch_e is not None else cch_e - cch_s)
+        if local_e > local_s:
+            blocks_wf.append(raw[:, local_s:local_e].astype(np.float32).copy())
+
+        del raw
+        gc.collect()
+
+    raw_1ch = np.concatenate(blocks_1ch, axis=0) if blocks_1ch else np.empty(0)
+    raw_wf  = np.concatenate(blocks_wf,  axis=0) if blocks_wf  else np.empty((0, 0))
+    del blocks_1ch, blocks_wf
+    gc.collect()
+
+    return raw_1ch, raw_wf, global_t0, fs_orig, gauge_length, cache_ch_start, n_ch_total
+
+
+# plotting
+
+def plot_channel(sel_ch, entries, t_start_dt, t_end_dt,
+                 plot_ch_s, plot_ch_e, save_folder, run_num):
+    log(f"\n  Plotting channel {sel_ch} ...")
+
+    try:
+        raw_1ch, raw_wf, global_t0, fs_orig, gauge_length, cache_ch_start, n_ch_total = \
+            load_window(entries, t_start_dt, t_end_dt, sel_ch, plot_ch_s, plot_ch_e)
+    except Exception as e:
+        log(f"    load_window failed: {e}")
+        traceback.print_exc()
+        return
+
+    if global_t0 is None or len(raw_1ch) == 0:
+        log(f"    No data for channel {sel_ch}. Skipping.")
+        return
+
+    N = len(raw_1ch)
+
+    # Master time axis: t[i] = i / fs_orig — pure integer arithmetic.
+    # All other axes derive from the same formula so they cover the same range.
+    t_raw     = np.arange(N, dtype=np.float64) / fs_orig
+    total_sec = t_raw[-1]
+
+    sos      = make_sos(fs_orig, FREQ_MIN, FREQ_MAX)
+    filt_raw = sosfiltfilt(sos, raw_1ch)
+    rms_arr  = compute_rms(filt_raw, fs_orig, RMS_WINDOW_SEC)
+
+    # RMS time: centre of each window
+    n_win = int(RMS_WINDOW_SEC * fs_orig)
+    t_rms = (np.arange(len(rms_arr)) * n_win + n_win / 2.0) / fs_orig
+
+    # Waterfall: bandpass then plain stride subsample.
+    # t_wf[k] = k * WF_STRIDE / fs_orig — same integer formula as t_raw.
+    if raw_wf.shape[0] > 0 and raw_wf.shape[1] > 0:
+        wf_bp  = sosfiltfilt(sos, raw_wf.astype(np.float64), axis=0).astype(np.float32)
+        wf_dec = wf_bp[::WF_STRIDE, :]
+        del wf_bp, raw_wf
+    else:
+        wf_dec = np.empty((0, 0), dtype=np.float32)
+    gc.collect()
+
+    N_wf = wf_dec.shape[0]
+    t_wf = np.arange(N_wf, dtype=np.float64) * WF_STRIDE / fs_orig
+
+    log(f"    N={N}  N_wf={N_wf}  total_sec={total_sec:.3f}  "
+        f"t_wf[-1]={t_wf[-1]:.3f}  t_rms[-1]={t_rms[-1]:.3f}  fs={fs_orig:.0f}")
+
+    optical_pos = sel_ch * gauge_length
+
+    # clip and MAD-clip waterfall
+    np.clip(wf_dec, -WF_SPIKE_CLIP, WF_SPIKE_CLIP, out=wf_dec)
+    if N_wf > 0 and wf_dec.shape[1] > 0:
+        ch_med = np.median(wf_dec, axis=0)
+        mad    = np.maximum(np.median(np.abs(wf_dec - ch_med[None, :]), axis=0), 1e-9)
+        for c in range(wf_dec.shape[1]):
+            wf_dec[:, c] = np.clip(wf_dec[:, c],
+                                   -WF_MAD_MULT * mad[c], WF_MAD_MULT * mad[c])
+
+    stride2  = max(1, N_wf // MAX_WF_ROWS)
+    wf_plot  = wf_dec[::stride2, :]
+    t_wf_plt = t_wf[::stride2]
+    del wf_dec
+    gc.collect()
+
+    n_wf_ch    = wf_plot.shape[1]
+    eff_ch_s   = max(plot_ch_s, cache_ch_start)
+    ch_indices = np.arange(eff_ch_s, eff_ch_s + n_wf_ch)
+    ch_pos_m   = ch_indices * gauge_length
+
+    t_end_actual = global_t0 + datetime.timedelta(seconds=total_sec)
+    fmt = time_fmt(global_t0)
+
+    # All 4 data panels share col 0 — identical pixel width guaranteed.
+    # Colorbar axes are added manually with fig.add_axes after subplots_adjust
+    # so they sit outside the data area and never shrink any panel.
+    fig = plt.figure(figsize=(FIG_WIDTH, 24))
+    gs  = gridspec.GridSpec(4, 1,
+                            height_ratios=[2.0, 2.5, 1.2, 1.2],
+                            hspace=0.18)
+
+    ax_spec = fig.add_subplot(gs[0])
+    ax_wf   = fig.add_subplot(gs[1], sharex=ax_spec)
+    ax_ph   = fig.add_subplot(gs[2], sharex=ax_spec)
+    ax_rms  = fig.add_subplot(gs[3], sharex=ax_spec)
+
+    # Reserve right margin for colorbars; left margin for panel labels + ylabels
+    fig.subplots_adjust(left=0.13, right=0.87, top=0.96, bottom=0.06,
+                        hspace=0.18)
+
+    # Panel 1: Spectrogram
+    log("    Drawing spectrogram ...")
+    freqs_s, t_bins_s, Pxx_s = sp_spectrogram(
+        raw_1ch, fs=fs_orig,
+        nperseg=SPEC_NFFT, noverlap=SPEC_NOVERLAP,
+        scaling="density", mode="psd")
+
+    fmask  = (freqs_s >= FREQ_MIN) & (freqs_s <= FREQ_MAX)
+    f_plot = freqs_s[fmask]
+    Pxx_db = 10 * np.log10(Pxx_s[fmask, :] + 1e-20)
+
+    dt_s = t_bins_s[1] - t_bins_s[0] if len(t_bins_s) > 1 else 1.0
+    df_s = f_plot[1]   - f_plot[0]   if len(f_plot)   > 1 else 1.0
+    t_se = np.r_[t_bins_s[0] - dt_s/2,
+                 (t_bins_s[:-1] + t_bins_s[1:]) / 2,
+                 t_bins_s[-1] + dt_s/2]
+    f_se = np.r_[max(0.0, f_plot[0] - df_s/2),
+                 (f_plot[:-1] + f_plot[1:]) / 2,
+                 f_plot[-1] + df_s/2]
+
+    im_spec = ax_spec.pcolormesh(
+        t_se, f_se, Pxx_db, cmap=SPEC_CMAP,
+        vmin=float(np.percentile(Pxx_db, 5)),
+        vmax=float(np.percentile(Pxx_db, 95)),
+        shading="flat", rasterized=True)
+
+    ax_spec.set_xlim(0, total_sec)
+    ax_spec.set_ylim(FREQ_MIN, FREQ_MAX)
+    ax_spec.set_ylabel("Frequency (Hz)", fontsize=11, labelpad=10)
+    ax_spec.xaxis.set_major_formatter(plt.FuncFormatter(fmt))
+    ax_spec.grid(False)
+    plt.setp(ax_spec.xaxis.get_majorticklabels(), visible=False)
+    ax_spec.set_title(
+        f"Channel {sel_ch}  (Optical Position: {optical_pos:.1f} m)  |  "
+        f"{FREQ_MIN:.0f}\u2013{FREQ_MAX:.0f} Hz  |  GL = {gauge_length:.2f} m\n"
+        f"{global_t0.strftime('%Y-%m-%d %H:%M:%S UTC')} to "
+        f"{t_end_actual.strftime('%H:%M:%S UTC')}",
+        fontsize=11, pad=8)
+    ax_spec.text(-0.085, 0.5, "Spectrogram", transform=ax_spec.transAxes,
+                 fontsize=10, fontweight="bold", color="dimgray",
+                 ha="center", va="center", rotation=90)
+
+    # Panel 2: Waterfall
+    log("    Drawing waterfall ...")
+    dt_w = t_wf_plt[1] - t_wf_plt[0] if len(t_wf_plt) > 1 else WF_STRIDE / fs_orig
+    t_we = np.r_[t_wf_plt[0] - dt_w/2,
+                 (t_wf_plt[:-1] + t_wf_plt[1:]) / 2,
+                 t_wf_plt[-1] + dt_w/2]
+    dch = (ch_pos_m[1] - ch_pos_m[0]) / 2 if len(ch_pos_m) > 1 else gauge_length / 2
+    ch_edges = np.r_[ch_pos_m[0] - dch,
+                     (ch_pos_m[:-1] + ch_pos_m[1:]) / 2,
+                     ch_pos_m[-1] + dch]
+
+    im_wf = ax_wf.pcolormesh(
+        t_we, ch_edges, wf_plot.T,
+        cmap=WF_CMAP, norm=Normalize(vmin=-WF_VMAX, vmax=WF_VMAX),
+        shading="flat", rasterized=True)
+
+    ax_wf.set_xlim(0, total_sec)
+    ax_wf.set_ylabel("Optical Distance (m)", fontsize=10, labelpad=9)
+    ax_wf.xaxis.set_major_formatter(plt.FuncFormatter(fmt))
+    plt.setp(ax_wf.xaxis.get_majorticklabels(), visible=False)
+
+    n_yticks  = min(8, n_wf_ch)
+    ytick_idx = np.round(np.linspace(0, n_wf_ch - 1, n_yticks)).astype(int)
+    ax_wf.set_yticks(ch_pos_m[ytick_idx])
+    ax_wf.set_yticklabels(
+        [f"Ch {ch_indices[i]}  {ch_pos_m[i]:.0f} m" for i in ytick_idx],
+        fontsize=9)
+
+    sel_pos = sel_ch * gauge_length
+    if ch_pos_m[0] <= sel_pos <= ch_pos_m[-1]:
+        ax_wf.axhline(sel_pos, color="magenta", lw=1.2, ls="--", alpha=0.85)
+        ax_wf.text(total_sec * 0.01,
+                   sel_pos + (ch_pos_m[-1] - ch_pos_m[0]) * 0.01,
+                   f"Ch {sel_ch}", color="magenta", fontsize=9, va="bottom")
+
+    ax_wf.text(-0.085, 0.5, "Waterfall", transform=ax_wf.transAxes,
+               fontsize=10, fontweight="bold", color="dimgray",
+               ha="center", va="center", rotation=90)
+
+    # Panel 3: Phase
+    log("    Drawing phase ...")
+    ax_ph.plot(t_raw, filt_raw, lw=0.3, color="steelblue", alpha=0.9, clip_on=True)
+    ax_ph.set_ylabel("Phase (rad)", fontsize=11, labelpad=10)
+    ax_ph.set_ylim(-PHASE_YLIM, PHASE_YLIM)
+    ax_ph.axhline(0, color="gray", lw=0.4, ls="--", alpha=0.5)
+    ax_ph.grid(True, ls="--", alpha=0.25)
+    ax_ph.xaxis.set_major_formatter(plt.FuncFormatter(fmt))
+    plt.setp(ax_ph.xaxis.get_majorticklabels(), visible=False)
+    ax_ph.text(-0.085, 0.5, "Phase", transform=ax_ph.transAxes,
+               fontsize=10, fontweight="bold", color="dimgray",
+               ha="center", va="center", rotation=90)
+
+    # Panel 4: RMS
+    log("    Drawing RMS ...")
+    ax_rms.plot(t_rms, rms_arr, lw=0.8, color="darkorange", alpha=0.9, clip_on=True)
+    ax_rms.set_ylabel("RMS Phase (rad)", fontsize=11, labelpad=10)
+    ax_rms.set_xlabel("Time (UTC)", fontsize=11)
+    ax_rms.set_ylim(0, RMS_YLIM)
+    ax_rms.grid(True, ls="--", alpha=0.25)
+    ax_rms.xaxis.set_major_formatter(plt.FuncFormatter(fmt))
+    plt.setp(ax_rms.xaxis.get_majorticklabels(), rotation=45, ha="right")
+    ax_rms.annotate(
+        f"window = {RMS_WINDOW_SEC} s  |  y-limit = {RMS_YLIM} rad",
+        xy=(0.01, 0.93), xycoords="axes fraction", fontsize=8, color="gray")
+    ax_rms.text(-0.085, 0.5, "RMS", transform=ax_rms.transAxes,
+                fontsize=10, fontweight="bold", color="dimgray",
+                ha="center", va="center", rotation=90)
+
+    # Add colorbar axes manually in the right margin so they never affect panel widths.
+    # fig.add_axes([left, bottom, width, height]) in figure coordinates.
+    # We read the bounding boxes of the data axes after subplots_adjust to align precisely.
+    fig.canvas.draw()   # needed to get accurate bboxes
+
+    cb_width = 0.012    # colorbar bar width in figure coords
+    cb_gap   = 0.005    # gap between data panel right edge and colorbar
+
+    def make_cb_ax(ax):
+        bb   = ax.get_position()
+        left = bb.x1 + cb_gap
+        return fig.add_axes([left, bb.y0, cb_width, bb.height])
+
+    cax_spec = make_cb_ax(ax_spec)
+    cax_wf   = make_cb_ax(ax_wf)
+    cax_ph   = make_cb_ax(ax_ph)
+    cax_rms  = make_cb_ax(ax_rms)
+
+    plt.colorbar(im_spec, cax=cax_spec).set_label(
+        "PSD (dB re 1 rad\u00b2/Hz)", fontsize=9)
+    plt.colorbar(im_wf, cax=cax_wf).set_label(
+        "Phase (rad)", fontsize=9)
+
+    # Phase and RMS: add thin invisible colorbars as spacers so right edges align
+    # with spectrogram and waterfall — achieved by identical cb_gap + cb_width.
+    # Instead of invisible colorbars, we simply draw no colorbar but the margin
+    # (right=0.87) already reserves the same space for all rows.
+    # Add subtle border to distinguish the empty cb area:
+    for cax in [cax_ph, cax_rms]:
+        cax.set_visible(False)
+
+    fname = (f"Combined4Panel_Ch{sel_ch}_Pos{optical_pos:.0f}m_"
+             f"{FREQ_MIN:.0f}-{FREQ_MAX:.0f}Hz_{run_num:04d}.jpeg")
+    save_path = os.path.join(save_folder, fname)
+    plt.savefig(save_path, format="jpeg", dpi=DPI_SAVE, bbox_inches="tight")
+    plt.close()
+    log(f"    Saved: {save_path}")
+
+
+def main():
+    os.makedirs(SAVE_FOLDER, exist_ok=True)
+    build_cache(H5_FOLDER, CACHE_FOLDER)
+
+    t_start_dt = (datetime.datetime.strptime(TIME_START, "%Y-%m-%d %H:%M:%S")
+                  if TIME_START else None)
+    t_end_dt   = (datetime.datetime.strptime(TIME_END, "%Y-%m-%d %H:%M:%S")
+                  if TIME_END   else None)
+
+    log(f"DAS Combined 4-Panel Plot  (from cache)")
+    log(f"  Cache    : {CACHE_FOLDER}")
+    log(f"  Save     : {SAVE_FOLDER}")
+    log(f"  Channels : {SELECTED_CHANNELS}")
+    log(f"  WF range : {PLOT_CH_START} - {PLOT_CH_END or 'all'}")
+    log(f"  Window   : {TIME_START or 'all'} -> {TIME_END or 'all'}")
+
+    entries = select_cache_files(CACHE_FOLDER, t_start_dt, t_end_dt)
+    if not entries:
+        log("No valid cache files found. Run with FORCE_REBUILD_CACHE=True.")
+        return
+    log(f"  Files    : {len(entries)}")
+
+    plot_ch_s = max(0, PLOT_CH_START)
+    plot_ch_e = PLOT_CH_END
+
+    for sel_ch in SELECTED_CHANNELS:
+        existing = [f for f in os.listdir(SAVE_FOLDER)
+                    if f.startswith(f"Combined4Panel_Ch{sel_ch}_") and f.endswith(".jpeg")]
+        run_num = len(existing) + 1
+        plot_channel(sel_ch, entries, t_start_dt, t_end_dt,
+                     plot_ch_s, plot_ch_e, SAVE_FOLDER, run_num)
+        gc.collect()
+
+    log("\nAll channels done.")
+
+
+if __name__ == "__main__":
+    main()
